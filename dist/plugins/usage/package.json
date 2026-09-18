@@ -1,0 +1,17 @@
+{
+  "name": "dsh-usage",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh token 用量统计插件（host 半边 + Web 客户端半边）",
+  "exports": {
+    ".": "./usage.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

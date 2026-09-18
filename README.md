@@ -94,10 +94,17 @@ python -m venv .venv
 dist/
 ├── DeepSeekHarness.exe
 └── plugins/
-    └── gitbash/
-        ├── manifest.json        # id / name / description / order / entry / patch
-        ├── cordis.patch.yml     # 要合进 dsh profile 的补丁片段
-        ├── gitbash-shell.mjs    # 插件本体
+    ├── gitbash/                     # 内置插件：Windows 上改用 Git Bash
+    │   ├── manifest.json            # id / name / description / order / entry / patch
+    │   ├── cordis.patch.yml         # 要合进 dsh profile 的补丁片段
+    │   ├── gitbash-shell.mjs        # 插件本体（host 半边）
+    │   └── README.md
+    └── usage/                       # 内置插件：token 用量统计
+        ├── manifest.json
+        ├── cordis.patch.yml         # 只插 host 半边
+        ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
+        ├── usage.mjs                # host 半边：采集 + 读取接口
+        ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
         └── README.md
 ```
 
@@ -120,6 +127,23 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
 改成 `bash`。**纯插件**：不写 agent 预设、不动 `$DSH_HOME/.agent-presets`，
 改名和提示词改写都在运行时拦截工具注册完成。原理、代价和踩过的坑见
 [dist/plugins/gitbash/README.md](dist/plugins/gitbash/README.md)。
+
+### 内置：`usage`
+
+统计 token 用量。界面上在**左下角、设置按钮上方**多一个入口，点开是堆叠柱状图：
+最近 14 天一天一根柱子，每个模型一个颜色自下而上叠，鼠标移到色块上提示
+「模型 + 颜色 + 占比 + 用量」，用量统一按**万 token** 显示。
+
+- **账本**：`~/.dsh/profiles/web/plugins/usage/data/usage.json`，按「天 × 模型」累计，
+  落盘走「写临时文件 + rename」+ 800ms 去抖。
+- **口径**：`input + cacheRead + cacheWrite + output`，四桶互不重叠
+  （与上游 `dsh-token-meter` 的 `usageTokens()` 一致）。
+- **只统计安装之后新发生的调用**，不回填历史 —— 所以刚装上是空的，发一轮对话就有数据。
+  同一 (turn, step) 反复结算时按「覆盖」而非「累加」，重试/流式收敛不会虚高。
+- **双面插件**：host 半边（`usage.mjs`）采集并注册鉴权过的 `GET /api/usage.data`；
+  浏览器半边（`lib/client.js`）靠 `package.json` 里的 `dsh.client` 被
+  `dsh-client-modules` 自动发现，**不用写进补丁**。
+- 细节与设计取舍见 [dist/plugins/usage/README.md](dist/plugins/usage/README.md)。
 
 ## 两个容易踩的坑
 

@@ -1,0 +1,10 @@
+{
+  "id": "usage",
+  "name": "Token 用量统计",
+  "description": "采集模型返回的 usage，按「天 × 模型」累计总 token，并在 Web 界面左下角（设置按钮上方）加一个查看入口：堆叠柱状图按天展示各模型用量与占比，鼠标移到色块上显示模型、颜色、占比、用量。数据存在插件目录的 data/usage.json。",
+  "version": "1.0.0",
+  "order": 20,
+  "entry": "usage.mjs",
+  "patch": "cordis.patch.yml",
+  "requiresRestart": true
+}
