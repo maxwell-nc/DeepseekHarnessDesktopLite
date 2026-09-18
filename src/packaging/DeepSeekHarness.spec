@@ -15,6 +15,12 @@ import os
 SRC = os.path.abspath(os.path.join(SPECPATH, ".."))       # <项目根>/src
 ICON = os.path.join(SRC, "assets", "app.ico")
 
+# 启动加速补丁：node --import 要求它是磁盘上的真实文件，必须打进包里，
+# 运行时从 sys._MEIPASS/runtime/ 取。
+RUNTIME_FILES = [
+    (os.path.join(SRC, "runtime", "dsh_fastboot.mjs"), "runtime"),
+]
+
 # 动态导入的模块，静态分析扫不到，必须显式声明
 hiddenimports = [
     "webview.platforms.winforms",
@@ -46,7 +52,7 @@ a = Analysis(
     [os.path.join(SRC, "dsh_shell.py")],
     pathex=[SRC],
     binaries=[],
-    datas=[],
+    datas=RUNTIME_FILES,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

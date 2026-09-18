@@ -145,6 +145,56 @@ def log(message):
             pass
 
 
+# --------------------------------------------------------------------------- #
+# 耗时埋点
+#
+# 设 DSH_UI_TIMING=1 启动后，日志里会多出形如
+#   [t+  3.412s] [timing] 服务就绪
+# 的打点行（相对本模块第一条语句的秒数），用来定位"打开慢 / 退出慢"到底慢在哪一段。
+# 默认关闭，正常使用时日志不受影响。
+# --------------------------------------------------------------------------- #
+
+T_START = time.perf_counter()
+TIMING = (os.environ.get("DSH_UI_TIMING") or "").strip() == "1"
+
+
+def mark(label):
+    """打一个耗时点。标签统一带 [timing] 前缀，方便 grep。"""
+    if TIMING:
+        log("[t+%7.3fs] [timing] %s" % (time.perf_counter() - T_START, label))
+
+
+def _timed(label, func, *args, **kwargs):
+    """跑 func 并记录耗时，返回其结果。"""
+    if not TIMING:
+        return func(*args, **kwargs)
+    begin = time.perf_counter()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        log("[t+%7.3fs] [timing] %s（耗时 %.3fs）" % (
+            time.perf_counter() - T_START, label, time.perf_counter() - begin))
+
+
+def report_onefile_extract():
+    """单文件 exe 每次启动都要把自己解压到 %TEMP%\\_MEIxxxxx，这段开销用户完全看不见。
+
+    用解压目录的创建时间近似它（只在开了埋点时才记录）。若这段明显偏大，
+    说明瓶颈在打包形态本身，而不是代码。
+    """
+    if not TIMING:
+        return
+    mei = getattr(sys, "_MEIPASS", None)
+    if not mei:
+        return
+    try:
+        cost = time.time() - os.path.getctime(mei)
+    except OSError:
+        return
+    log("[t+%7.3fs] [timing] onefile 解压+解释器启动 ≈ %.3fs（%s）"
+        % (time.perf_counter() - T_START, cost, mei))
+
+
 def _setup_logging():
     try:
         handler = logging.FileHandler(SHELL_LOG, encoding="utf-8")
@@ -235,6 +285,39 @@ def dsh_home():
 
 def plugin_profile_dir():
     return os.path.join(dsh_home(), "profiles", PLUGIN_PROFILE)
+
+
+# --------------------------------------------------------------------------- #
+# 启动加速补丁
+#
+# dsh 在启动期间每注册一个插件就把全部前端 client bundle 重算一遍（实测 7 次、
+# 约 3 秒），而这段时间没有任何消费者。补丁把「组合」推迟到首次被读取时，只算
+# 一次。补丁是独立 .mjs，由 node --import 注入，不改 dsh 任何文件；
+# DSH_UI_FASTBOOT=0 可整体关掉。
+# --------------------------------------------------------------------------- #
+
+FASTBOOT_ENABLED = (os.environ.get("DSH_UI_FASTBOOT") or "1").strip() != "0"
+
+
+def fastboot_script():
+    """补丁脚本路径。打包后在 exe 的自解压目录里，开发态在 src/runtime/。"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(
+            getattr(sys, "_MEIPASS", BASE_DIR), "runtime", "dsh_fastboot.mjs"
+        )
+    return os.path.join(BASE_DIR, "runtime", "dsh_fastboot.mjs")
+
+
+def client_modules_entry():
+    """dsh-client-modules 的入口文件，补丁要拿它的原型打洞。"""
+    return os.path.join(
+        RUNTIME_DIR, "node_modules", "@deepseek-ai", "dsh-client-modules", "lib", "index.js"
+    )
+
+
+def file_url(path):
+    """node 的 --import 只认 URL，Windows 绝对路径得转成 file:///C:/...。"""
+    return "file:///" + os.path.abspath(path).replace("\\", "/")
 
 
 def _is_link(path):
@@ -583,16 +666,28 @@ def _node_dirs():
     return out
 
 
-def find_node():
-    """找到 node.exe。优先 PATH，其次常见安装位置。"""
+_node_cache = []
+
+
+def find_node(refresh=False):
+    """找到 node.exe。优先 PATH，其次常见安装位置。
+
+    结果会缓存：启动路径上 ``main()`` 和 ``DshService.start()`` 各要一次，
+    而 ``shutil.which`` 遍历一遍 PATH 实测近 90ms。想重新探测（比如刚装完 Node）
+    就传 ``refresh=True``；找不到时不写缓存，下次照样重新找。
+    """
+    if _node_cache and not refresh:
+        return _node_cache[0]
     found = shutil.which("node")
+    if not found:
+        for folder in _node_dirs():
+            candidate = os.path.join(folder, "node.exe")
+            if os.path.isfile(candidate):
+                found = candidate
+                break
     if found:
-        return found
-    for folder in _node_dirs():
-        candidate = os.path.join(folder, "node.exe")
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+        _node_cache[:] = [found]
+    return found
 
 
 def find_npm_cli(node_exe):
@@ -616,14 +711,6 @@ def find_npm_cli(node_exe):
 # --------------------------------------------------------------------------- #
 
 
-def port_open(port=PORT, host=HOST, timeout=0.5):
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
 def http_alive(port=PORT, timeout=2.5):
     """服务是否已经在监听。
 
@@ -639,8 +726,65 @@ def http_alive(port=PORT, timeout=2.5):
         return False
 
 
-def pids_on_port(port=PORT):
-    """列出正在监听该端口的进程 PID（用于兜底清理残留服务）。"""
+def _pids_on_port_native(port):
+    """直接读系统 TCP 表，拿监听某端口的进程 PID。
+
+    起一次 netstat 进程实测要 0.23s（exe 里更慢），而 iphlpapi 是进程内的，
+    只要 1 毫秒上下。拿不到就返回 None，让调用方回落到 netstat。
+    只查 IPv4 —— 本程序只监听 127.0.0.1。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return None
+
+    class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+        _fields_ = [
+            ("dwState", wintypes.DWORD),
+            ("dwLocalAddr", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("dwRemoteAddr", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    AF_INET = 2                     # ulAf
+    TCP_TABLE_OWNER_PID_ALL = 5     # TableClass
+    MIB_TCP_STATE_LISTEN = 2        # dwState
+
+    try:
+        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        size = wintypes.DWORD(0)
+        # 第一次调用只为问出需要的缓冲区大小（必然报 ERROR_INSUFFICIENT_BUFFER）
+        iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET,
+                                     TCP_TABLE_OWNER_PID_ALL, 0)
+        if size.value <= 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        ret = iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET,
+                                           TCP_TABLE_OWNER_PID_ALL, 0)
+        if ret != 0:
+            return None
+        count = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD)).contents.value
+        rows = ctypes.cast(
+            ctypes.byref(buf, ctypes.sizeof(wintypes.DWORD)),
+            ctypes.POINTER(MIB_TCPROW_OWNER_PID),
+        )
+        pids = set()
+        for index in range(count):
+            row = rows[index]
+            if row.dwState != MIB_TCP_STATE_LISTEN:
+                continue
+            # dwLocalPort 是网络字节序，低 16 位才是端口
+            if socket.ntohs(row.dwLocalPort & 0xFFFF) == port:
+                pids.add(int(row.dwOwningPid))
+        return pids
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pids_on_port_netstat(port):
     pids = set()
     try:
         proc = subprocess.run(
@@ -663,6 +807,14 @@ def pids_on_port(port=PORT):
                 except ValueError:
                     pass
     return pids
+
+
+def pids_on_port(port=PORT):
+    """列出正在监听该端口的进程 PID（用于兜底清理残留服务）。"""
+    native = _pids_on_port_native(port)
+    if native is not None:
+        return native
+    return _pids_on_port_netstat(port)
 
 
 def kill_tree(pid):
@@ -885,10 +1037,10 @@ class DshService(object):
         with self._lock:
             if self.managed_running():
                 return True
-            node_exe = find_node()
+            node_exe = _timed("find_node()", find_node)
             if not node_exe:
                 raise RuntimeError("未检测到 Node.js，请先安装 Node.js 18+")
-            entry = self.entry_script()
+            entry = _timed("entry_script()", self.entry_script)
             if not os.path.isfile(entry):
                 raise RuntimeError("DeepSeek Harness 尚未安装完整：%s" % entry)
 
@@ -900,13 +1052,32 @@ class DshService(object):
             except OSError:
                 self._log_handle = None
 
+            env = self._child_env(node_exe, effective_registry())
+
+            # 注入启动加速补丁：见 fastboot_script() 上方的说明。
+            # 补丁缺失或目标不存在时静默降级，按原样启动。
+            cmd = [node_exe]
+            patch = fastboot_script()
+            target = client_modules_entry()
+            if FASTBOOT_ENABLED and os.path.isfile(patch) and os.path.isfile(target):
+                env["DSH_FASTBOOT_TARGET"] = file_url(target)
+                if TIMING:
+                    env["DSH_UI_FASTBOOT_VERBOSE"] = "1"
+                cmd += ["--import", file_url(patch)]
+                log("已注入启动加速补丁: %s" % patch)
+            else:
+                log(
+                    "未注入启动加速补丁（enabled=%s 补丁=%s 目标=%s）"
+                    % (FASTBOOT_ENABLED, os.path.isfile(patch), os.path.isfile(target))
+                )
+
             # --no-open：别让 dsh 自己弹系统浏览器，界面交给本程序的 WebView2
-            cmd = [node_exe, entry, "web", "--no-open"]
+            cmd += [entry, "web", "--no-open"]
             log("启动服务: %s (cwd=%s)" % (" ".join(cmd), WORKSPACE_DIR))
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=WORKSPACE_DIR,
-                env=self._child_env(node_exe, effective_registry()),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -945,8 +1116,13 @@ class DshService(object):
         except Exception as exc:  # noqa: BLE001
             log("读取服务输出异常: %s" % exc)
 
-    def stop(self, wait_release=25.0):
-        """停掉服务：先收自己拉起的进程，再兜底清掉占用端口的残留 node。"""
+    def stop(self, wait_release=10.0):
+        """停掉服务：先收自己拉起的进程，再兜底清掉占用端口的残留 node。
+
+        判断"端口上还有没有服务在听"一律走 pids_on_port()，不要用 TCP connect 探活：
+        进程刚被 taskkill 掉的那一瞬间，connect 既连不上也收不到拒绝，会一直卡到
+        timeout（0.5s）才返回，比读一次系统 TCP 表慢三个数量级。
+        """
         with self._lock:
             proc = self._proc
             self._proc = None
@@ -955,15 +1131,22 @@ class DshService(object):
 
         if proc is not None and proc.poll() is None:
             log("停止服务 pid=%s" % proc.pid)
-            kill_tree(proc.pid)
-
-        for pid in pids_on_port():
-            log("清理占用 %d 端口的残留进程 pid=%s" % (PORT, pid))
-            kill_tree(pid)
+            _timed("taskkill 服务进程树", kill_tree, proc.pid)
 
         deadline = time.time() + wait_release
-        while time.time() < deadline and port_open():
-            time.sleep(0.3)
+        released = False
+        while True:
+            stale = _timed("查端口占用进程", pids_on_port)
+            if not stale:
+                released = True
+                break
+            for pid in stale:
+                log("清理占用 %d 端口的残留进程 pid=%s" % (PORT, pid))
+                _timed("taskkill 残留 pid=%s" % pid, kill_tree, pid)
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+        mark("端口已释放（stop 结束，released=%s）" % released)
 
         if handle is not None:
             try:
@@ -973,7 +1156,7 @@ class DshService(object):
 
         self.web_url = None
 
-        if port_open():
+        if not released:
             log("警告：端口 %d 仍被占用" % PORT)
             return False
         return True
@@ -998,7 +1181,9 @@ class DshService(object):
             if not announced and http_alive():
                 announced = True
                 log("端口已就绪，等待 dsh 输出访问地址")
-            time.sleep(0.4)
+            # 小步快跑：dsh 打印 token 之后最多再等 0.15s 就能接上，
+            # 原来 0.4s 的粒度会白等掉两三百毫秒
+            time.sleep(0.15)
         return False
 
     def read_service_tail(self, lines=12):
@@ -1327,6 +1512,12 @@ class DshShellApp(object):
         # 插件管理器窗口底部那行状态文字
         self.plugin_status = ""
         self.plugin_error = False
+        # 启动页状态投递器。evaluate_js 会同步 Invoke 到 UI 线程，而程序刚起来时
+        # 主线程正忙着初始化 WebView2（实测约 3 秒），直接在调用方发就会白等这几秒，
+        # 连 service.start() 都被一起推迟。所以这里只存"最新一条"，由后台线程慢慢发。
+        self._ui_lock = threading.Lock()
+        self._ui_pending = None
+        self._ui_worker = None
 
     def set_plugin_status(self, text, error=False):
         self.plugin_status = str(text or "")
@@ -1335,13 +1526,33 @@ class DshShellApp(object):
     # ---------------- 启动页状态 ---------------- #
 
     def set_status(self, text, detail="", kind=""):
-        self._eval(
+        self._post_ui(
             "window.__setStatus && window.__setStatus(%s, %s, %s);"
             % (js_str(text), js_str(detail), js_str(kind))
         )
 
     def set_tail(self, text):
-        self._eval("window.__setTail && window.__setTail(%s);" % js_str(text))
+        self._post_ui("window.__setTail && window.__setTail(%s);" % js_str(text))
+
+    def _post_ui(self, script):
+        """把要执行的 JS 丢给后台线程串行发送，调用方立即返回。"""
+        with self._ui_lock:
+            self._ui_pending = script          # 旧状态直接丢掉，只保留最新一条
+            if self._ui_worker is not None:
+                return
+            worker = threading.Thread(target=self._ui_pump, daemon=True)
+            self._ui_worker = worker
+        worker.start()
+
+    def _ui_pump(self):
+        while True:
+            with self._ui_lock:
+                script = self._ui_pending
+                self._ui_pending = None
+                if script is None:
+                    self._ui_worker = None
+                    return
+            self._eval(script)
 
     def _eval(self, script):
         window = self.window
@@ -1504,15 +1715,16 @@ class DshShellApp(object):
     def _ensure_service(self, reload_page=True):
         try:
             self.service.ensure_runtime_manifest()
+            mark("_ensure_service: manifest 就绪")
 
             # 启动前先按「已启用的插件」把 plugins/ 镜像进 dsh 并刷新补丁文件。
             # 失败不阻塞启动：dsh 照常按现有补丁跑。
             try:
-                sync_plugins(on_note=self.set_plugin_status)
+                _timed("sync_plugins", sync_plugins, on_note=self.set_plugin_status)
             except Exception as exc:  # noqa: BLE001
                 log("同步插件异常（继续启动）: %s" % exc)
 
-            version = self.service.installed_version()
+            version = _timed("读已安装版本", self.service.installed_version)
             if not version:
                 self.set_status(
                     "首次运行，正在安装 DeepSeek Harness…",
@@ -1532,13 +1744,16 @@ class DshShellApp(object):
 
             # dsh 的访问 token 每次启动都会变，必须由本程序自己拉起服务才能拿到地址，
             # 所以端口上如果有残留进程，先清掉再重新启动。
-            if port_open():
+            # 这里读系统 TCP 表，不用 TCP connect 探活：exe 首次 connect 到一个
+            # 没人监听的端口不会立刻收到 RST，会一路卡到 timeout（实测 0.23s）。
+            if _timed("探测端口是否有旧服务", pids_on_port):
                 log("端口 %d 已被占用，先清理再启动" % PORT)
                 self.set_status("正在清理旧服务…", "停掉上一次残留的 dsh 进程")
                 self.service.stop()
 
             self.set_status("正在启动本地服务…", "dsh web --no-open @ %s" % URL)
-            self.service.start()
+            _timed("service.start()", self.service.start)
+            mark("服务进程已拉起")
             if not self.service.wait_ready(poll_log=self.set_tail):
                 self.set_status(
                     "服务启动失败或超时",
@@ -1548,11 +1763,13 @@ class DshShellApp(object):
                 self.set_tail(self.service.read_service_tail())
                 self.notify("本地服务启动失败，请查看日志")
                 return
+            mark("服务已就绪（token 到手）")
 
             log("服务就绪：%s（dsh %s）" % (self.service.access_url, version or "?"))
             self.set_status("正在加载界面…", "dsh %s" % (version or "?"), "done")
             if reload_page:
                 self.load_url()
+                mark("已下发 load_url（dsh 前端开始加载）")
         except Exception as exc:  # noqa: BLE001
             log("启动流程异常: %s\n%s" % (exc, traceback.format_exc()))
             self.set_status("启动失败", str(exc), "err")
@@ -1727,26 +1944,45 @@ class DshShellApp(object):
         if self.quitting:
             return
         self.quitting = True
-        log("退出：清理托盘与本地服务")
+        log("退出：先把界面撤掉，再清理后台")
+
+        # 第一步只做「让用户看到程序已经关了」：隐藏窗口 + 停托盘。
+        # 这两步都是毫秒级，所以点完「退出」界面几乎立刻消失。
+        for name in ("window", "manager_window"):
+            window = getattr(self, name)
+            if window is None:
+                continue
+            try:
+                _timed("%s hide" % name, window.hide)
+            except Exception:
+                pass
         try:
             if self.icon is not None:
-                self.icon.stop()
+                _timed("icon.stop()", self.icon.stop)
         except Exception:
             pass
+        mark("界面已撤下（用户视角退出完成）")
+
+        # 第二步才是真正耗时的收尾：杀 node 服务（1 秒上下）、销毁 WebView2 控件。
+        # 放后台做，用户不必为了等它跑完而多盯一秒；跑完立刻结束进程。
+        threading.Thread(target=self._shutdown, daemon=True).start()
+
+    def _shutdown(self):
+        """退出收尾：停服务 -> 销毁窗口 -> 强杀进程。"""
         try:
             self.service.stop()
         except Exception as exc:  # noqa: BLE001
             log("退出时停止服务失败: %s" % exc)
-        try:
-            if self.window is not None:
-                self.window.destroy()
-        except Exception:
-            pass
-        try:
-            if self.manager_window is not None:
-                self.manager_window.destroy()
-        except Exception:
-            pass
+        mark("服务已停")
+        for name in ("window", "manager_window"):
+            window = getattr(self, name)
+            if window is None:
+                continue
+            try:
+                _timed("%s destroy" % name, window.destroy)
+            except Exception:
+                pass
+        mark("窗口已销毁")
         log("退出完成")
         os._exit(0)
 
@@ -1817,17 +2053,21 @@ def main():
     log("插件目录: %s" % plugins_dir())
     log("dsh 目录: %s" % dsh_home())
     log("node: %s" % find_node())
+    mark("main() 开始（frozen=%s）" % getattr(sys, "frozen", False))
+    report_onefile_extract()
 
     ok, _handle = acquire_single_instance()
     if not ok:
         log("已有实例在运行，本次启动退出")
         return
+    mark("单实例锁就绪")
 
     try:
         if not os.path.isfile(ICON_PATH):
             save_ico(ICON_PATH, 256)
     except Exception as exc:  # noqa: BLE001
         log("写入图标失败: %s" % exc)
+    mark("图标文件就绪")
 
     app = DshShellApp()
 
@@ -1842,6 +2082,7 @@ def main():
     )
     app.window = window
     window.events.closing += app.on_window_closing
+    mark("主窗口对象已建（尚未真正创建 WebView2）")
 
     # 插件管理器：先建好、隐藏着，托盘菜单点开再 show()。
     # pywebview 6 的 hidden=True 在 winforms 后端上就是"建好不显示"。
@@ -1861,9 +2102,12 @@ def main():
         manager.events.closing += app.on_manager_closing
     except Exception as exc:  # noqa: BLE001
         log("创建插件管理器窗口失败: %s\n%s" % (exc, traceback.format_exc()))
+    mark("插件管理器窗口对象已建")
 
     app.start_tray()
+    mark("托盘已起")
     app.start_service_async()
+    mark("服务启动已派发（后台线程）")
 
     try:
         webview.start(
@@ -1877,6 +2121,7 @@ def main():
         log("WebView2 启动失败: %s\n%s" % (exc, traceback.format_exc()))
         app.notify("WebView2 初始化失败，请确认已安装 WebView2 运行时")
         return
+    mark("GUI 主循环结束")
 
     log("GUI 主循环结束 (quitting=%s)" % app.quitting)
     if not app.quitting:

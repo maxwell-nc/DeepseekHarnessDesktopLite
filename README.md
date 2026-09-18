@@ -25,6 +25,7 @@ src/                         代码（含构建、打包、自测）
 ├── build.py                 一键打包入口
 ├── assets/app.ico           打包用的图标（缺了 build.py 会按 app_icon.py 重新生成）
 ├── packaging/*.spec         PyInstaller 打包配置
+├── runtime/dsh_fastboot.mjs 启动加速补丁（node --import 注入，不改 dsh 文件）
 └── tools/                   自测脚本
     ├── probe_service.py         服务层：安装 / 启动 / 健康检查 / 更新 / 停止
     ├── probe_auth.py            鉴权链路：401 → 303 + Set-Cookie → 200
@@ -127,6 +128,51 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
    本程序启动服务时抓取该地址（`--no-open` 同时阻止 dsh 自己弹浏览器），
    带 token 访问会拿到 `303 + Set-Cookie`，Cookie 落在 `webview/` 里持久化。
 2. **token 每次启动都变**，所以服务必须由本程序自己拉起，不能复用外部已在跑的实例。
+3. **`evaluate_js` / `load_url` / `hide` 都会同步 Invoke 到 UI 线程。** 程序刚起来的
+   那几秒，主线程正卡在 `webview.start()` 里初始化 WebView2，此时从后台线程发任何
+   窗口操作都会被堵住（实测约 3 秒）。所以启动页状态走 `_post_ui()` 投递给独立线程
+   异步发，`service.start()` 排在它们前面 —— 否则 dsh 那段冷启动会被平白推迟 3 秒。
+   同理，退出时「隐藏窗口 + 停托盘」是前台做的（毫秒级），杀服务和销毁窗口这些
+   耗时动作交给 `_shutdown()` 后台做。
+
+## 启动构成 / 启动加速
+
+一次冷启动（真机 exe，`DSH_UI_TIMING=1` 实测）：**进程启动 → 界面开始加载 ≈ 3.6 秒**。
+
+| 阶段 | 耗时 | 说明 |
+| --- | --- | --- |
+| onefile 自解压 + 解释器启动 | 0.53s | 单文件模式的固定开销，用户看不见但躲不掉 |
+| 壳自身（单实例锁 / 图标 / 建窗口 / 托盘 / 起服务） | 0.02s | `service.start()` 本身只要 0.01s |
+| dsh 冷启动 | ≈ 3.6s | 大头，见下 |
+
+dsh 那 3.6 秒里：
+
+- **约 1.5s 是 Node 加载 200 多个包**。试过 `NODE_COMPILE_CACHE`（字节码缓存），
+  实测没有收益（4.60s vs 4.51s），已放弃。
+- **约 0.8s 是拼接前端 client bundle**。原本这里是 **3.0 秒** —— 见下。
+- 其余是插件加载、起 HTTP 服务、打印 token。
+
+### 启动加速补丁（`src/runtime/dsh_fastboot.mjs`）
+
+`dsh-client-modules` 会在**每注册一个插件**时把全部前端 client bundle 重新拼接一遍
+（含逐行生成的 identity sourcemap）。实测一次启动它被调用 **7 次**、合计 **3.0 秒**，
+而启动阶段这些产物**没有任何消费者**——前端还没连上来，第一次读取发生在浏览器请求
+首页（`webserver/index-inject`）或 `.js` 产物（`bundleResource`）的时候。
+
+补丁把这四个字段（`composed` / `responses` / `batchResponses` /
+`previousBatchResponses`）改成访问器：启动期间 `compose()` 只记账，**首次被读时才算一次**，
+之后立刻交回 dsh 原逻辑。实测 7 次 → 1 次，真实 exe 的「界面开始加载」从 **4.75s 降到 3.62s**。
+
+- **不改 dsh 任何文件**，由 `node --import` 注入，路径写在 `DshService.start()` 里。
+- **只做延迟、不改结果**：首次读取时按完整表格算，结果与不加速时一致；
+  若有人在启动中途读图，只是让加速失效，不会给出错误结果；整个补丁包在 `try/catch` 里，
+  任何异常都只意味着「没加速」。
+- **开关**：`DSH_UI_FASTBOOT=0` 关闭；`DSH_UI_TIMING=1` 时补丁会把
+  「跳过 N 次 / 实际算 1 次花多久」写进 `service.log`。
+- **验证结论**：补丁前后各抓一次首页 `window.__DSH_BOOT__` 里的产物做逐字节比对 ——
+  dsh 每次启动会混入随机 nonce，产物字节本来就不可能完全一致，所以比对前先归一化；
+  归一化后实测 55 份产物里 54 份字节完全相同，只有那个 11MB 的批量包拼接顺序会变
+  （`orderByModuleGraph` 允许同优先级按扫描顺序打破平局，与补丁无关）。
 
 ### 自测
 
@@ -139,6 +185,19 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
 ```
 
 `probe_gui.py` 可以带一个参数：不传跑源码，传 exe 路径就测打包产物。
+
+#### 耗时诊断
+
+觉得「打开慢 / 退出慢」时，带 `DSH_UI_TIMING=1` 启动（源码或 exe 都行），
+`shell.log` 里会多出形如 `[t+  3.412s] [timing] <阶段名>` 的打点，直接看时间花在哪一段：
+
+```bat
+set DSH_UI_TIMING=1
+dist\DeepSeekHarness.exe
+```
+
+对照的耗时构成见上一节。改动启动 / 退出路径后，务必守着上面那条
+「`evaluate_js` 会同步 Invoke 到 UI 线程」的约束 —— 那是当初 3 秒延迟的根源。
 
 ## 已验证的边界
 
