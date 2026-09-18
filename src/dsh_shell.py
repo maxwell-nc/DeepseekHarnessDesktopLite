@@ -256,6 +256,10 @@ def effective_registry():
 PLUGIN_STATE_FILE = os.path.join(DATA_DIR, "plugins.json")
 PLUGIN_PROFILE = "web"
 PLUGIN_STAMP = ".dsh-ui-plugin.json"
+# 插件包**根目录**下的这些目录是「运行态」，不是包的一部分：既不参与指纹，
+# 也不镜像过去。插件要落盘的数据一律自己找地方放（约定是 <DATA_DIR>/data/，
+# 由 DSH_UI_DATA_DIR 告诉它），塞在包里面的话每次重抄都会连数据一起删掉。
+PLUGIN_RUNTIME_DIRS = frozenset({"data"})
 PATCH_BEGIN = "# >>> dsh-ui 插件管理块（自动生成，勿手工编辑） >>>"
 PATCH_END = "# <<< dsh-ui 插件管理块 <<<"
 PATCH_HEADER = (
@@ -339,11 +343,22 @@ def _remove_tree(path):
     return True
 
 
+def _same_dir(left, right):
+    """两个路径是不是同一个目录（Windows 上大小写不敏感，走 normcase）。"""
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
 def _dir_signature(path):
-    """目录指纹：文件数 + 最新 mtime。用来判断源目录变没变，避免每次启动都重刷。"""
+    """目录指纹：文件数 + 最新 mtime。用来判断源目录变没变，避免每次启动都重刷。
+
+    根目录下的运行态目录（PLUGIN_RUNTIME_DIRS）不算数 —— 它们不进镜像，改了也
+    不该触发重抄。
+    """
     count = 0
     newest = 0.0
-    for root, _dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
+        if _same_dir(root, path):
+            dirs[:] = [name for name in dirs if name not in PLUGIN_RUNTIME_DIRS]
         for name in files:
             count += 1
             try:
@@ -465,8 +480,21 @@ def plugin_enabled(state, package):
 
 
 def _sync_one(package, dest):
-    """把插件包镜像到 dsh 的 plugins/ 下；源目录没变就跳过（省掉每次启动的复制）。"""
+    """把插件包镜像到 dsh 的 plugins/ 下；源目录没变就跳过（省掉每次启动的复制）。
+
+    包根目录下的运行态目录（PLUGIN_RUNTIME_DIRS，目前只有 `data/`）**不镜像**：
+    它是插件自己管的数据，镜像一份只会多出一个副本，而且在重抄时把源目录那份
+    盖回镜像里运行时的账本。插件的数据现在统一放在 <DATA_DIR>/data/ 下，
+    由 DSH_UI_DATA_DIR 环境变量告诉它 —— 外壳怎么同步都碰不到。
+    """
     signature = _dir_signature(package.path)
+
+    def ignore_runtime(src, names):
+        """copytree 的回调：只过滤包**根目录**下的运行态目录，子目录里的同名目录不动。"""
+        if not _same_dir(src, package.path):
+            return set()
+        return {name for name in names if name in PLUGIN_RUNTIME_DIRS}
+
     stamp_path = os.path.join(dest, PLUGIN_STAMP)
     try:
         with open(stamp_path, "r", encoding="utf-8") as fh:
@@ -482,7 +510,7 @@ def _sync_one(package, dest):
     existed = os.path.lexists(dest)
     if existed:
         _remove_tree(dest)
-    shutil.copytree(package.path, dest)
+    shutil.copytree(package.path, dest, ignore=ignore_runtime)
     with open(stamp_path, "w", encoding="utf-8") as fh:
         json.dump(
             {
@@ -902,6 +930,9 @@ class DshService(object):
         env["NO_COLOR"] = "1"
         env["FORCE_COLOR"] = "0"
         env["BROWSER"] = "none"          # 阻止 dsh 自己弹系统浏览器
+        # 插件的运行数据（比如 usage 插件的账本）统一放到本程序的数据根下，
+        # 别塞进会被整目录重抄的插件目录里。约定见 PLUGIN_RUNTIME_DIRS。
+        env["DSH_UI_DATA_DIR"] = DATA_DIR
         env.pop("npm_config_prefix", None)
         env.pop("NODE_OPTIONS", None)
         if registry:

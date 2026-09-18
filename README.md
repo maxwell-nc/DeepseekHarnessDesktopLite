@@ -79,6 +79,7 @@ python -m venv .venv
 | `webview/` | WebView2 用户数据（Cookie、localStorage） | 界面偏好重置；登录态由下面的 `.dsh` 决定 |
 | `config.json` | 配置，`registry` 字段控制 npm 源，留空表示跟随系统 npm 配置 | 回到默认（国内镜像） |
 | `plugins.json` | 插件启用状态（插件管理器写，红灯/绿灯就是它） | 所有插件回到默认「开启」 |
+| `data/usage.json` | usage 插件的 token 账本 | 用量统计清零（从零开始记） |
 | `shell.log` / `service.log` / `stdio.log` | 日志 | 无影响 |
 
 **② `%USERPROFILE%\.dsh\`** —— dsh 自己的数据目录，**这个才是有状态的部分**：
@@ -112,7 +113,8 @@ dist/
 
 1. 扫 `plugins/` 下所有带 `manifest.json` 的包；没记录过的插件默认**开启**；
 2. 开启的包 → 整目录镜像到 `%USERPROFILE%\.dsh\profiles\web\plugins\<id>\`
-   （源目录没变就跳过复制，靠 `.dsh-ui-plugin.json` 指纹判断）；
+   （源目录没变就跳过复制，靠 `.dsh-ui-plugin.json` 指纹判断；包**根目录**下的 `data/`
+   是插件的运行态，既不复制也不进指纹 —— 插件自己的数据放 `<数据目录>/data/`）；
 3. 关闭的包 → 删掉安装副本（只删本程序装的，认指纹文件；目录链接一律不碰）；
 4. 把已启用插件的补丁片段按 `order` 拼成一个托管块，重写
    `~/.dsh/profiles/web/cordis.patch.yml` ——
@@ -131,15 +133,19 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
 ### 内置：`usage`
 
 统计 token 用量。界面上在**左下角、设置按钮上方**多一个入口，点开是堆叠柱状图：
-最近 14 天一天一根柱子，每个模型一个颜色自下而上叠，鼠标移到色块上提示
-「模型 + 颜色 + 占比 + 用量」，用量统一按**万 token** 显示。
+固定最近 15 天一天一根柱子（今天在最右、横轴刻度只写「日」），每个模型一个颜色自下而上叠，
+鼠标移到色块上提示「模型 + 颜色 + **当日占比** + 用量」。没有用量的那天留一条占位短横。
+用量单位自动进位：**万 token**，到 1 亿走**亿**。
 
-- **账本**：`~/.dsh/profiles/web/plugins/usage/data/usage.json`，按「天 × 模型」累计，
-  落盘走「写临时文件 + rename」+ 800ms 去抖。
+- **账本**：`%LOCALAPPDATA%\DeepSeekHarness\data\usage.json` —— 外壳自己的数据根
+  （和 `config.json` / `plugins.json` 同处），**不放插件目录**：插件包是整目录重抄的镜像，
+  放里面会被连坐删掉、还天然多出一个副本。按「天 × 模型」累计，落盘走
+  「写临时文件 + rename」+ 800ms 去抖。
 - **口径**：`input + cacheRead + cacheWrite + output`，四桶互不重叠
   （与上游 `dsh-token-meter` 的 `usageTokens()` 一致）。
 - **只统计安装之后新发生的调用**，不回填历史 —— 所以刚装上是空的，发一轮对话就有数据。
   同一 (turn, step) 反复结算时按「覆盖」而非「累加」，重试/流式收敛不会虚高。
+- **刷新会回读账本文件**：每次读（含 5 秒轮询）都先同步磁盘，别处写进去的账能看见。
 - **双面插件**：host 半边（`usage.mjs`）采集并注册鉴权过的 `GET /api/usage.data`；
   浏览器半边（`lib/client.js`）靠 `package.json` 里的 `dsh.client` 被
   `dsh-client-modules` 自动发现，**不用写进补丁**。

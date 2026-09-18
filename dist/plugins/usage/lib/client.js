@@ -22,7 +22,7 @@ window.__ModuleLoader__.load({
 			".dshu-label{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}" +
 			".dshu-badge{flex:none;font-size:11px;color:var(--dsw-alias-label-tertiary,#8a93a8);font-variant-numeric:tabular-nums}" +
 			".dshu-backdrop{position:fixed;inset:0;z-index:9000;background:transparent}" +
-			".dshu-panel{position:fixed;z-index:9001;box-sizing:border-box;width:640px;max-width:calc(100vw - 28px);max-height:min(80vh,660px);overflow:auto;overscroll-behavior:contain;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.20));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6;-webkit-user-select:none;user-select:none}" +
+			".dshu-panel{position:fixed;z-index:9001;box-sizing:border-box;width:min(460px,calc(100vw - 28px));max-height:min(80vh,660px);overflow:auto;overscroll-behavior:contain;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.20));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6;-webkit-user-select:none;user-select:none}" +
 			".dshu-head{display:flex;align-items:center;gap:10px}" +
 			".dshu-title{flex:1;font-size:14px;font-weight:600}" +
 			".dshu-btn{height:26px;padding:0 10px;border:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.14));border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6478);font:inherit;font-size:12px;line-height:1;cursor:pointer}" +
@@ -32,14 +32,16 @@ window.__ModuleLoader__.load({
 			".dshu-sumUnit{font-size:12px;color:var(--dsw-alias-label-tertiary,#8a93a8)}" +
 			".dshu-legend{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:10px}" +
 			".dshu-legendItem{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary,#5b6478);max-width:100%}" +
-			".dshu-legendName{max-width:220px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}" +
+			".dshu-legendName{max-width:150px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}" +
 			".dshu-swatch{flex:none;width:10px;height:10px;border-radius:3px}" +
 			".dshu-legendNum{color:var(--dsw-alias-label-tertiary,#8a93a8);font-variant-numeric:tabular-nums}" +
-			".dshu-chart{display:flex;align-items:stretch;gap:6px;height:180px;margin-top:14px;padding:0 0 0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.10))}" +
-			".dshu-col{flex:1;min-width:0;display:flex;flex-direction:column;height:100%}" +
-			".dshu-bar{flex:1;display:flex;flex-direction:column-reverse;min-height:0;border-radius:4px 4px 0 0;overflow:hidden}" +
+			".dshu-chart{display:flex;align-items:stretch;justify-content:center;gap:5px;height:168px;margin-top:14px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.10))}" +
+			".dshu-col{flex:1 1 0;min-width:0;max-width:20px;display:flex;flex-direction:column;height:100%}" +
+			".dshu-bar{flex:1;display:flex;flex-direction:column-reverse;min-height:0;border-radius:3px 3px 0 0;overflow:hidden}" +
 			".dshu-seg{flex:none;width:100%;transition:filter .12s ease}" +
-			".dshu-seg:hover{filter:brightness(1.18)}" +
+			".dshu-seg:hover{filter:brightness(.94)}" +
+			".dshu-segEmpty{flex:none;width:100%;height:3px;border-radius:2px;background:rgba(22,32,58,.12)}" +
+			".dshu-dayEmpty{opacity:.5}" +
 			".dshu-dayLabel{margin-top:6px;height:14px;font-size:10px;line-height:14px;text-align:center;color:var(--dsw-alias-label-tertiary,#8a93a8);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden}" +
 			".dshu-tip{position:fixed;z-index:9002;transform:translate(-50%,-100%);margin-top:-10px;padding:8px 11px;border-radius:10px;background:rgba(23,29,44,.95);color:#fff;font-size:12px;line-height:1.75;white-space:nowrap;box-shadow:0 10px 26px rgba(16,24,40,.30);pointer-events:none}" +
 			".dshu-tipRow{display:flex;align-items:center;gap:6px}" +
@@ -47,6 +49,7 @@ window.__ModuleLoader__.load({
 			".dshu-tipDim{color:rgba(255,255,255,.62)}" +
 			".dshu-empty{padding:40px 0;text-align:center;color:var(--dsw-alias-label-tertiary,#8a93a8);font-size:12px;line-height:1.9}" +
 			".dshu-foot{margin-top:12px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.10));font-size:11px;color:var(--dsw-alias-label-caption,#98a0b3);line-height:1.75}" +
+			".dshu-path{font-family:ui-monospace,Consolas,'Courier New',monospace;color:var(--dsw-alias-label-tertiary,#8a93a8);word-break:break-all}" +
 			".dshu-warn{color:#b45309}";
 		const tagId = "dsh-usage/client.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -60,32 +63,57 @@ window.__ModuleLoader__.load({
 		//#region dsh-usage/client/index.js
 		/** 宿主侧注册的读取接口（走 connection 的鉴权通道，同源 fetch 即可）。 */
 		const API_PATH = "/api/usage.data";
-		/** 模型配色：按「全期用量从多到少」分配，柱子与图例用同一份顺序，永远一致。 */
+		/**
+		 * 模型配色：按「全期用量从多到少」分配，柱子与图例用同一份顺序，永远一致。
+		 *
+		 * 刻意走**柔和**的浅色系（天蓝/浅绿/杏黄…），不用饱和深色 —— 一天一根柱子
+		 * 挨着排，深色堆一片会压得整块图很闷。相邻两位取了不同色相，叠在一起也分得开。
+		 */
 		const PALETTE = [
-			"#4d6bfe",
-			"#119e6a",
-			"#e8912d",
-			"#8b5cf6",
-			"#d63c4c",
-			"#0ea5e9",
-			"#7a9e1e",
-			"#e5679b",
-			"#0f766e",
-			"#7c4dff"
+			"#6cb6f5",
+			"#6ecf9e",
+			"#f2b96b",
+			"#a892f0",
+			"#f2949f",
+			"#5fc9c3",
+			"#b5d96b",
+			"#f0a184",
+			"#8fa8f2",
+			"#d3a0e8"
 		];
-		/** 柱状图最多画多少天（宿主一次最多给 30 天，这里只取最后 14 天让柱子够宽）。 */
-		const MAX_DAYS = 14;
+		/** 柱状图固定画多少天：横轴永远是「今天往前 MAX_DAYS 天」，没数据的那天画占位。 */
+		const MAX_DAYS = 15;
 		/** 打开面板时的轮询间隔。 */
 		const POLL_MS = 5000;
 		const WAN = 1e4;
+		const YI = 1e8;
+		/** 四舍五入后就会到 1 亿的那个点 —— 用来避免写出「10000.0 万」。 */
+		const YI_CUTOFF = 9999.5 * WAN;
 		const h = react.createElement;
 
-		/** 万 token，保留两位（用量按用户要求统一走「万」）。 */
-		function formatWan(tokens) {
-			const value = (Number(tokens) || 0) / WAN;
+		/**
+		 * 用量单位：不到 1 亿走「万」，到 1 亿进位成「亿」。
+		 *
+		 * 按**单个数值**自动选单位，不做全局面板统一：一个模型 1.2 亿、另一个
+		 * 3000 万时，各显示各的读起来更顺；硬统一会冒出「0.30 亿」这种数字。
+		 */
+		function measure(tokens) {
+			const value = Number(tokens) || 0;
+			if (value >= YI_CUTOFF) return { value: value / YI, unit: "亿" };
+			return { value: value / WAN, unit: "万" };
+		}
+
+		/** 数值本身的有效位：上千不留小数，小数则保两位。 */
+		function formatValue(value) {
 			if (value >= 1e3) return value.toFixed(0);
 			if (value >= 100) return value.toFixed(1);
 			return value.toFixed(2);
+		}
+
+		/** 「1.23 亿」/「456.7 万」。 */
+		function formatAmount(tokens) {
+			const amount = measure(tokens);
+			return formatValue(amount.value) + " " + amount.unit;
 		}
 
 		function formatShare(part, whole) {
@@ -94,16 +122,60 @@ window.__ModuleLoader__.load({
 			return (pct >= 10 ? pct.toFixed(1) : pct.toFixed(2)) + "%";
 		}
 
-		function formatClock(iso) {
+		/** 数据文件大小（脚注里显示，让你知道账本多大）。 */
+		function formatSize(bytes) {
+			const value = Number(bytes) || 0;
+			if (value >= 1024 * 1024) return (value / (1024 * 1024)).toFixed(1) + " MB";
+			if (value >= 1024) return (value / 1024).toFixed(1) + " KB";
+			return value + " B";
+		}
+
+		/** 数据文件的最后修改时间：今天只给时分，别的日子补月日。 */
+		function formatStamp(iso) {
 			if (typeof iso !== "string" || iso.length === 0) return "";
 			const parsed = new Date(iso);
 			if (Number.isNaN(parsed.getTime())) return "";
 			const pad = (value) => String(value).padStart(2, "0");
-			return pad(parsed.getHours()) + ":" + pad(parsed.getMinutes());
+			const clock = pad(parsed.getHours()) + ":" + pad(parsed.getMinutes()) + ":" + pad(parsed.getSeconds());
+			const now = new Date();
+			const sameDay =
+				parsed.getFullYear() === now.getFullYear() &&
+				parsed.getMonth() === now.getMonth() &&
+				parsed.getDate() === now.getDate();
+			return sameDay ? clock : pad(parsed.getMonth() + 1) + "-" + pad(parsed.getDate()) + " " + clock;
 		}
 
+		/**
+		 * 横轴刻度：只写「日」，不写月份。
+		 *
+		 * 列宽被压到 20px（柱子要细），写「09-15」放不下会被 overflow 裁掉；
+		 * 完整日期在 hover 气包和 `title` 里都有。
+		 */
 		function formatDay(date) {
-			return typeof date === "string" && date.length === 10 ? date.slice(5) : String(date ?? "");
+			return typeof date === "string" && date.length === 10 ? date.slice(8) : String(date ?? "");
+		}
+
+		/** 本地日期键 YYYY-MM-DD（和宿主切天的口径一致：本地时区，不用 UTC）。 */
+		function dateKey(date) {
+			const pad = (value) => String(value).padStart(2, "0");
+			return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate());
+		}
+
+		/**
+		 * 横轴：从 anchor（今天是哪天）往前数 count 天的日期键。
+		 *
+		 * 天数在这里补齐，而不是拿账本里「有记录的天」来铺 —— 中间某天完全没调用过
+		 * 模型时，账本里根本没有那一天，直接铺会让柱子错位、也看不出中间空了一段。
+		 */
+		function recentKeys(anchor, count) {
+			const base = new Date(anchor + "T00:00:00");
+			const keys = [];
+			for (let back = count - 1; back >= 0; back -= 1) {
+				const day = new Date(base);
+				day.setDate(day.getDate() - back);
+				keys.push(dateKey(day));
+			}
+			return keys;
 		}
 
 		/** 图例 + 柱子共用的配色表。 */
@@ -116,34 +188,61 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 堆叠柱状图：横轴是最近 MAX_DAYS 天，每天一根柱子，柱子按模型分色自下而上堆叠。
-		 * 鼠标移到某一段上，弹出「模型 + 颜色 + 占比 + 用量」的气泡。
+		 * 堆叠柱状图：横轴是固定的 MAX_DAYS 天（今天往前数），每天一根柱子，
+		 * 柱子按模型分色自下而上堆叠。鼠标移到某一段上弹「模型 + 颜色 + 占比 + 用量」。
+		 *
+		 * 那天完全没有用量时不画柱子，只留一条浅色短横当占位 —— 日期照常出现在横轴上，
+		 * 一眼能看出「那天没用过」，而不是柱子整体左移、看不出缺了哪天。
 		 *
 		 * 用的是普通 div + 百分比高度，不用 SVG/Canvas：hover 命中、气包容错、
-		 * 主题变量继承都更省事，13 根柱子也没性能问题。
+		 * 主题变量继承都更省事，十几根柱子也没性能问题。
 		 *
 		 * 每根柱子都按**同一个全局模型顺序**（用量从多到少）自下而上铺色，某天缺某个
 		 * 模型就跳过 —— 这样同一个颜色在各天永远落在同一层，横向比得起来。
 		 */
-		function UsageChart({ days, models, colors, total }) {
+		function UsageChart({ days, models, colors }) {
 			const [tip, setTip] = react.useState(null);
 			const scale = Math.max(
 				1,
 				...days.map((day) => day.total || 0)
 			);
-			const show = (event, date, modelId, tokens) => {
+			/**
+			 * 弹气泡。占比按**当天**的合计算，不是全期 —— 柱子本来就是「一天一根」，
+			 * 看的是那天各模型怎么分的；拿全期总量当分母，日内的差异会被压成零点几个百分点。
+			 */
+			const show = (event, day, modelId, tokens) => {
 				const rect = event.currentTarget.getBoundingClientRect();
 				setTip({
 					x: rect.left + rect.width / 2,
 					y: rect.top,
-					date,
+					date: day.date,
 					modelId,
 					tokens,
 					color: colors.get(modelId) ?? PALETTE[0],
-					share: formatShare(tokens, total)
+					share: formatShare(tokens, day.total)
 				});
 			};
 			const hide = () => setTip(null);
+			/** 一天的一根柱子：有量就按模型从下往上叠色，没量就只给一条占位短横。 */
+			const bars = (day) => {
+				if (!(day.total > 0)) {
+					return h("div", { className: "dshu-segEmpty", title: day.date + "：没有用量" });
+				}
+				return models.map((model) => {
+					const tokens = day.models[model.id]?.tokens ?? 0;
+					if (tokens <= 0) return null;
+					return h("div", {
+						key: model.id,
+						className: "dshu-seg",
+						style: {
+							height: Math.max(2, (tokens / scale) * 100) + "%",
+							background: colors.get(model.id) ?? PALETTE[0]
+						},
+						onMouseEnter: (event) => show(event, day, model.id, tokens),
+						onMouseLeave: hide
+					});
+				});
+			};
 			return h(
 				"div",
 				null,
@@ -154,25 +253,15 @@ window.__ModuleLoader__.load({
 						h(
 							"div",
 							{ className: "dshu-col", key: day.date },
+							h("div", { className: "dshu-bar" }, bars(day)),
 							h(
 								"div",
-								{ className: "dshu-bar" },
-								models.map((model) => {
-									const tokens = day.models[model.id]?.tokens ?? 0;
-									if (tokens <= 0) return null;
-									return h("div", {
-										key: model.id,
-										className: "dshu-seg",
-										style: {
-											height: Math.max(2, (tokens / scale) * 100) + "%",
-											background: colors.get(model.id) ?? PALETTE[0]
-										},
-										onMouseEnter: (event) => show(event, day.date, model.id, tokens),
-										onMouseLeave: hide
-									});
-								})
-							),
-							h("div", { className: "dshu-dayLabel", title: day.date }, formatDay(day.date))
+								{
+									className: "dshu-dayLabel" + (day.total > 0 ? "" : " dshu-dayEmpty"),
+									title: day.date
+								},
+								formatDay(day.date)
+							)
 						)
 					)
 				),
@@ -187,13 +276,13 @@ window.__ModuleLoader__.load({
 								{ className: "dshu-tipRow" },
 								h("span", { className: "dshu-tipSwatch", style: { background: tip.color } }),
 								h("span", { className: "dshu-tipDim" }, tip.color),
-								h("span", { className: "dshu-tipDim" }, "· 占比 " + tip.share)
+								h("span", { className: "dshu-tipDim" }, "· 当日占比 " + tip.share)
 							),
 							h(
 								"div",
 								{ className: "dshu-tipRow" },
 								"用量 ",
-								h("span", { style: { fontWeight: 600 } }, formatWan(tip.tokens) + " 万"),
+								h("span", { style: { fontWeight: 600 } }, formatAmount(tip.tokens)),
 								h("span", { className: "dshu-tipDim" }, " · " + tip.date)
 							)
 						)
@@ -203,11 +292,16 @@ window.__ModuleLoader__.load({
 		/** 面板本体：头 + 总量 + 图例 + 柱状图 + 脚注。 */
 		function UsagePanel({ state, anchor, onRefresh, onClose }) {
 			const data = state.data;
-			const days = (data?.days ?? []).filter((day) => day.total > 0).slice(-MAX_DAYS);
 			const models = data?.models ?? [];
 			const total = data?.total ?? 0;
+			// 横轴固定 MAX_DAYS 天（今天往前数）：账本里根本没有的那天补成 0，画成占位短横
+			const recorded = new Map((data?.days ?? []).map((day) => [day.date, day]));
+			const days = recentKeys(data?.today || dateKey(new Date()), MAX_DAYS).map(
+				(date) => recorded.get(date) ?? { date, total: 0, models: {} }
+			);
+			const totalAmount = measure(total);
+			const file = data?.file;
 			const colors = colorTable(models);
-			const clock = formatClock(data?.updatedAt);
 			return h(
 				"div",
 				{ className: "dshu-panel", style: anchor, role: "dialog", "aria-label": "Token 用量" },
@@ -224,8 +318,8 @@ window.__ModuleLoader__.load({
 				h(
 					"div",
 					{ className: "dshu-sum" },
-					h("span", { className: "dshu-sumNum" }, formatWan(total)),
-					h("span", { className: "dshu-sumUnit" }, "万 token 累计" + (clock ? " · " + clock + " 更新" : "")),
+					h("span", { className: "dshu-sumNum" }, formatValue(totalAmount.value)),
+					h("span", { className: "dshu-sumUnit" }, totalAmount.unit + " token 累计"),
 					h("span", { className: "dshu-sumUnit" }, models.length > 0 ? "· " + models.length + " 个模型" : "")
 				),
 				total <= 0
@@ -248,19 +342,25 @@ window.__ModuleLoader__.load({
 										{ className: "dshu-legendItem", key: model.id },
 										h("span", { className: "dshu-swatch", style: { background: colors.get(model.id) } }),
 										h("span", { className: "dshu-legendName", title: model.id }, model.id),
-										h("span", { className: "dshu-legendNum" }, formatWan(model.tokens) + " 万"),
+										h("span", { className: "dshu-legendNum" }, formatAmount(model.tokens)),
 										h("span", { className: "dshu-legendNum" }, formatShare(model.tokens, total))
 									)
 								)
 							),
-							h(UsageChart, { days, models, colors, total })
+							h(UsageChart, { days, models, colors })
 						),
 				h(
 					"div",
 					{ className: "dshu-foot" },
-					"数据来源：模型返回的 usage（input + cache 读 + cache 写 + output），按本地日期切天、按模型分组，单位「万 token」。",
-					h("br", null),
-					"记录写在插件目录的 data/usage.json；柱子按天堆叠，鼠标移到色块上看模型、颜色、占比与用量。"
+					"数据文件：",
+					file?.path ? h("span", { className: "dshu-path", title: file.path }, file.path) : "（还没生成）",
+					file?.mtime
+						? h(
+								"span",
+								{ className: "dshu-legendNum" },
+								" · " + formatStamp(file.mtime) + " 写入 · " + formatSize(file.size)
+							)
+						: null
 				)
 			);
 		}
@@ -340,7 +440,7 @@ window.__ModuleLoader__.load({
 
 			const today = state.data?.today;
 			const todayTokens = state.data?.days?.find((day) => day.date === today)?.total ?? 0;
-			const badge = state.data === null ? "" : formatWan(todayTokens) + " 万";
+			const badge = state.data === null ? "" : formatAmount(todayTokens);
 
 			return h(
 				react.Fragment,

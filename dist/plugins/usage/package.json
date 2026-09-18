@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "dsh token 用量统计插件（host 半边 + Web 客户端半边）",

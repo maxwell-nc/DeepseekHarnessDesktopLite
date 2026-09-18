@@ -7,7 +7,7 @@
  * 1. **采集**：订阅 `session/event`，从会话事件里读模型返回的 usage
  *    （`assistant/message` / `assistant/attempt` 上的 `usage` 字段，或该次结算
  *    stream 里最后一个 `usage` chunk），按「天 × 模型」累计**总 token**，
- *    落到本插件目录下的 `data/usage.json`。
+ *    落到账本文件（默认 `<应用数据根>/data/usage.json`，见 dataFilePath()）。
  *
  * 2. **展示**：注册一条鉴权过的 HTTP 读取接口 `/api/usage.data`，浏览器那半边
  *    （lib/client.js）在左下角设置按钮上方渲染入口 + 堆叠柱状图。
@@ -37,16 +37,27 @@
  * 的调用」，绝不回填历史。这样重启进程、插件热重载、会话 fork 都不会重复计数
  * ——回填历史必须自己存每会话水位表，一旦水位丢了就会双计，代价比收益大。
  *
+ * **界面每次读取（刷新 / 轮询）都先回读数据文件**：内存账本只在进程启动时读过一次
+ * 文件，别的进程、上一次运行、或者手工改过的内容得靠 `reload()` 同步进来 ——
+ * 否则「刷新」永远只刷内存里那份旧的。详见 `reload()`。
+ *
  * **任何异常都吞掉**：插件崩了不能连带 dsh 起不来，所有入口都是 try/catch。
  *
+ * **账本不放在插件目录里**：插件包是被外壳「整目录重抄」到
+ * `<DSH_HOME>/profiles/<profile>/plugins/<id>/` 的，账本放里面有两个后果 ——
+ * 插件包一改就被连带删掉重建；源码树那份和镜像那份又会变成两个副本，谁是最新的
+ * 说不清。所以放到外壳自己的运行数据根（`%LOCALAPPDATA%\DeepSeekHarness`，
+ * 和它的 config.json / plugins.json 同处），全局只有一份。见 dataFilePath()。
+ *
  * 环境变量：
- *   DSH_USAGE_DATA=<路径>   把数据文件换个地方（默认 <插件目录>/data/usage.json）
+ *   DSH_UI_DATA_DIR=<目录>  外壳传给子进程的运行数据根（优先，见 dataFilePath）
+ *   DSH_USAGE_DATA=<路径>   直接指定账本文件（自测指向临时目录用，优先级最高）
  *   DSH_USAGE_QUIET=1       不打启动横幅
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 /** 稳定的 cordis 插件名。 */
 export const name = 'usage'
@@ -56,13 +67,32 @@ const TAG = '[dsh-usage]'
 /** 关掉启动横幅（`DSH_USAGE_QUIET=1`）。 */
 const QUIET = (process.env.DSH_USAGE_QUIET ?? '') === '1'
 
-/** 插件自己的目录 —— 插件包会被镜像到 <profile>/plugins/usage/，数据就放它下面。 */
-const HERE = dirname(fileURLToPath(import.meta.url))
+/**
+ * 外壳（dsh-ui）的运行数据根。
+ *
+ * 正常由外壳通过 `DSH_UI_DATA_DIR` 传进来。手工直接跑 `dsh web`（没经过外壳）
+ * 时按同样的约定自己算 —— 不能因为启动方式不同就让账本落到两个地方去。
+ */
+function appDataRoot() {
+  const given = (process.env.DSH_UI_DATA_DIR ?? '').trim()
+  if (given.length > 0) return given
+  const base = (process.env.LOCALAPPDATA ?? '').trim() || homedir()
+  return join(base, 'DeepSeekHarness')
+}
 
-/** 落盘位置：优先环境变量，其次插件目录下的 data/。 */
+/**
+ * 账本文件位置：`<应用数据根>/data/usage.json`（默认
+ * `%LOCALAPPDATA%\DeepSeekHarness\data\usage.json`）。
+ *
+ * **为什么不放插件目录**：插件包是「源目录 → <profile>/plugins/<id>/」整目录重抄
+ * 的镜像，账本放里面等于把自己放进一个随时被删掉重建的目录里，而且源码树那份和
+ * 镜像那份天然变成两个副本。放到外壳自己的数据根就只有一份，插件包怎么同步都不
+ * 影响它。`DSH_USAGE_DATA` 用来直接指定文件（自测指向临时目录）。
+ */
 function dataFilePath() {
-  const override = (process.env.DSH_USAGE_DATA ?? '').trim()
-  return override.length > 0 ? override : join(HERE, 'data', 'usage.json')
+  const explicit = (process.env.DSH_USAGE_DATA ?? '').trim()
+  if (explicit.length > 0) return explicit
+  return join(appDataRoot(), 'data', 'usage.json')
 }
 
 /** 浏览器读取入口。走 connection 的鉴权通道，页面里同源 fetch 即可。 */
@@ -183,6 +213,15 @@ function writeState(path, state) {
   renameSync(tmp, path)
 }
 
+/** 文件最后修改时间（毫秒）；不存在 / 读不到返回 0。 */
+function mtimeOf(path) {
+  try {
+    return statSync(path).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
 /** 按日期键裁掉过老的天，防止文件无限长。 */
 function prune(state, today) {
   const keys = Object.keys(state.days)
@@ -204,7 +243,9 @@ function prune(state, today) {
  * 「当前模型」和「上一条 usage 样本」。
  */
 function createCollector(path) {
-  const state = readState(path)
+  let state = readState(path)
+  /** 我们上一次读/写这个文件时它的 mtime —— 用来判断文件有没有被别人动过。 */
+  let seenMtime = mtimeOf(path)
   const marks = new WeakMap()
   const slots = new WeakMap()
   let timer
@@ -358,6 +399,7 @@ function createCollector(path) {
     dirty = false
     try {
       writeState(path, state)
+      seenMtime = mtimeOf(path) // 这一笔是自己写的，别当成「被别人动过」
     } catch (error) {
       console.error(`${TAG} 写数据文件失败：${String(error?.message ?? error)}`)
     }
@@ -372,10 +414,54 @@ function createCollector(path) {
   }
 
   /**
+   * 回读数据文件，把**磁盘上的账本**同步进内存。
+   *
+   * 为什么需要：内存里的账本只在「本次进程启动」时读过一次文件。同一个
+   * `data/usage.json` 被别的进程写过时（同时开着别的 profile、进程被强杀后重启、
+   * 插件热重载、或者你自己手改过），内存就是旧的了 —— 界面每次读都先过这一手，
+   * 「刷新」才真的是刷新。
+   *
+   * 判定「有没有被别人动过」只看 mtime（我们每次读/写都记下当时的 mtime），
+   * 比拿 updatedAt 比内容可靠：别处写进来但内容恰好一样时也算动过，回读一次无害。
+   *
+   * 两个不覆盖内存的例外：
+   *   - 内存里还有**没落盘的增量**（dirty）时跳过：那会儿回读会把它冲掉，
+   *     新鲜度不值得拿数据换（等 800ms 落盘后下一次读自然就同步了）。
+   *   - 文件不在 / 读坏时不动内存：`readState` 那会儿给的是空账本，
+   *     不能拿它抹掉内存里的账。
+   *
+   * @returns 是否真的换成了磁盘上的状态。
+   */
+  function reload() {
+    if (dirty) return false
+    const mtime = mtimeOf(path)
+    if (mtime === 0 || mtime === seenMtime) return false
+    const disk = readState(path)
+    if (Object.keys(disk.days).length === 0 && Object.keys(state.days).length > 0) return false
+    state = disk
+    seenMtime = mtime
+    return true
+  }
+
+  /** 数据文件自身的信息，给界面脚注显示（文件还没落盘时也给路径，只是没时间/大小）。 */
+  function fileInfo() {
+    try {
+      const stat = statSync(path)
+      return { path, mtime: stat.mtime.toISOString(), size: stat.size }
+    } catch {
+      return { path, mtime: '', size: 0 }
+    }
+  }
+
+  /**
    * 给浏览器用的视图：最近 KEEP_DAYS_FOR_CLIENT 天 + 全期模型排行。
    * 颜色不上这里定 —— 由客户端按 models 顺序分配，柱子和图例自然一致。
+   *
+   * 每次调用都先 `reload()` 一次：界面上的「刷新」和 5 秒轮询都打到这儿，
+   * 所以拿到的永远是磁盘上最新的账本（见 reload 的说明）。
    */
   function payload(now) {
+    reload()
     const keys = Object.keys(state.days).sort()
     const recent = keys.slice(-KEEP_DAYS_FOR_CLIENT)
     const days = []
@@ -408,6 +494,7 @@ function createCollector(path) {
     return {
       today: dayKey(now),
       updatedAt: state.updatedAt,
+      file: fileInfo(),
       total: models.reduce((sum, model) => sum + model.tokens, 0),
       models,
       days
