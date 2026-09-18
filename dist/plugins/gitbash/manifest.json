@@ -1,0 +1,11 @@
+{
+  "id": "gitbash",
+  "name": "Git Bash 执行器",
+  "description": "Windows 上用 Git Bash 取代 PowerShell：接管 shell 执行器，并把模型看到的 shell 工具从 pwsh 改名为 bash。纯插件，不需要 agent 预设。",
+  "version": "2.0.0",
+  "order": 10,
+  "platforms": ["win32"],
+  "entry": "gitbash-shell.mjs",
+  "patch": "cordis.patch.yml",
+  "requiresRestart": true
+}

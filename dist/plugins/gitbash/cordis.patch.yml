@@ -1,0 +1,45 @@
+# dsh profile 补丁片段 —— 由 dsh-ui 的插件管理器拼进
+# <DSH_HOME>/profiles/<profile>/cordis.patch.yml 的托管块里。
+#
+# 本片段是一个 YAML 列表；托管块会把所有已启用插件的片段按 order 顺序拼在一起，
+# 所以片段之间不要互相引用，也不要写 YAML 文档头。
+#
+# 路径 `./plugins/gitbash/...` 以 **profile 目录** 为基准 —— 管理器把插件包复制到
+# <profile>/plugins/gitbash/ 之后，这个相对路径才成立。移动插件目录时同步改这一行。
+#
+# ── 为什么是这几条 ──────────────────────────────────────────────────────────
+# 上游 @deepseek-ai/dsh-base 按平台二选一：
+#     bash-sandbox  disabled: process.platform === 'win32'
+#     pwsh-sandbox  disabled: process.platform !== 'win32'
+# 于是 win32 上拿到的是 PowerShell 那一套。官方约定要求**成对处理**，否则 profile
+# 加载不了（两个执行器会抢同一个 ctx.shell）。这里关掉两个上游执行器，换成
+# plugins/gitbash/gitbash-shell.mjs —— 它继承上游执行器，只把 argv[0] 换成
+# Git Bash 绝对路径（Windows 的 PATH 上没有 bash.exe），默认走无沙箱分支。
+#
+# 模型看到 `bash` 还是 `pwsh`，由同一个插件在运行时改写工具注册解决：上游
+# `dsh-tool-pwsh` 注册的 `pwsh` 工具被改名为 `bash` 并换成 Git Bash 的提示词，
+# 因此**不再需要 agent 预设那一层**。详见插件目录里的 README.md。
+#
+# 注意：`name` 字段**不吃 `!!js`**（loader 会拿到表达式对象然后 name.startsWith 崩掉），
+# 只能写纯字符串；`disabled` 和 `config` 里可以用。
+
+# 上游的 POSIX bash 执行器：win32 上本来就被平台门控关着，这里显式关掉是为了
+# 跨平台一致 —— 它在 POSIX 上会打开，而它会和下面的插件抢同一个 ctx.shell。
+- id: bash-sandbox
+  disabled: true
+  config:
+    timeoutMs: 60000
+
+# PowerShell 执行器：它是 win32 上默认启用的那个 ctx.shell 提供方，必须关掉，
+# 否则和下面的插件重复注册。
+- id: pwsh-sandbox
+  disabled: true
+
+- insert:
+    - id: bash-gitbash
+      name: ./plugins/gitbash/gitbash-shell.mjs
+      config:
+        timeoutMs: 60000
+        # 接管的工具名（上游 Windows 上的 shell 工具）与改写后的名字
+        fromTool: pwsh
+        toolName: bash
