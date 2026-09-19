@@ -3,7 +3,14 @@
 PyInstaller 打包配置
 --------------------
 
-把 ``src/dsh_shell.py`` 打成 **无控制台** 的单文件 exe。
+把 ``src/dsh_shell.py`` 打成 **无控制台** 的 onedir 目录（``_internal/`` + exe）。
+
+产物由 ``build.py`` 搬进 ``dist/``（``dist`` 本身就是程序目录：exe + ``_internal/`` +
+``plugins/``）。本 spec 只负责打出一个自洽的 onedir 目录，不关心它最后落在哪。
+
+为什么不是 onefile：单文件 exe 每次启动都要把自己解压到 ``%TEMP%\\_MEIxxxxx``，
+实测多花 0.46s（含冷读），而且被强杀 / 崩溃时解压目录不会被清理，会慢慢吃掉
+临时盘（实测 18 个残留共 646MB）。换成目录后这段开销直接消失。
 
     <venv>/Scripts/python.exe src/build.py        # 由 build.py 调用
     pyinstaller src/packaging/DeepSeekHarness.spec --noconfirm --clean
@@ -67,9 +74,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,         # onedir：依赖交给下面的 COLLECT，exe 本体只是个启动器
     name="DeepSeekHarness",
     debug=False,
     bootloader_ignore_signals=False,
@@ -83,4 +89,16 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON if os.path.isfile(ICON) else None,
+)
+
+# onedir 产物： dist/DeepSeekHarness/DeepSeekHarness.exe + _internal/
+# PyInstaller 6.x 会把 binaries/datas 全收进 _internal/，sys._MEIPASS 指向它，
+# 所以 dsh_shell.py 里 fastboot_script() 的 _MEIPASS 拼法不用改。
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="DeepSeekHarness",
 )

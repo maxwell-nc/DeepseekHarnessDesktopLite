@@ -7,7 +7,8 @@
 
 - **WebView2 内核**：用系统自带的 Edge WebView2 渲染界面，不依赖外部浏览器
 - **亮色界面**：启动页与插件管理器都是亮色主题（底色 `#f4f6fb`，DeepSeek 蓝强调色 `#4d6bfe`）
-- **无命令行窗口**：打包为 windowed 单文件 exe，服务进程用 `CREATE_NO_WINDOW` 静默拉起
+- **无命令行窗口**：打包为 windowed onedir 目录（`exe` + `_internal/`），服务进程用
+  `CREATE_NO_WINDOW` 静默拉起
 - **系统托盘**：关闭窗口只是收进托盘，服务继续在后台跑；托盘菜单可重新打开界面
 - **插件管理器**：托盘 →「插件管理器」，绿灯启用 / 红灯关闭，下面一个「重启服务并生效」
 - **插件自动加载**：启动时按启用状态把 exe 同目录 `plugins/` 里的插件装进 dsh
@@ -35,7 +36,11 @@ src/                         代码（含构建、打包、自测）
     └── probe_plugin_manager.py  插件管理器窗口 + js_api 桥 + 红绿灯渲染
 
 build/                       PyInstaller 工作目录 + Python 字节码缓存（build/pycache）
-dist/                        产物：DeepSeekHarness.exe + plugins/（运行时资产，不进 exe）
+dist/
+├── plugins/                 插件源码，进版本库
+└── DeepSeekHarness/         onedir 产物（整个目录一起分发），里面自动镜像一份 plugins/
+    ├── DeepSeekHarness.exe
+    └── _internal/
 ```
 
 `.pyc` 不走源码目录：`dsh_shell.py` / `build.py` / `tools/*.py` 都设了 `sys.pycache_prefix`，
@@ -52,10 +57,18 @@ python -m venv .venv
 .venv/Scripts/python src/build.py
 ```
 
-产物：`dist/DeepSeekHarness.exe`
+产物（onedir，不是一个单文件）：
 
-`dist/plugins/` 是运行时资产（exe 同目录的插件包），**不打包进 exe**；
-构建脚本只会报一下有几个包，不会动它。
+```
+dist/DeepSeekHarness/
+├── DeepSeekHarness.exe      启动器，不能单独拷出来用
+├── _internal/               Python 运行时 + 依赖 + runtime/dsh_fastboot.mjs
+└── plugins/                 由构建脚本从 dist/plugins/ 镜像过来
+```
+
+**分发要把整个 `dist/DeepSeekHarness/` 压成 zip。**
+
+插件按**源码**放在 `dist/plugins/`（进版本库），**不打包进 exe**；构建时镜像进产物目录。
 
 ## 运行前提
 
@@ -89,24 +102,24 @@ python -m venv .venv
 
 ## 插件
 
-插件包放在 **exe 同目录的 `plugins/`**，一个插件一个子目录：
+插件包放在 **exe 同目录的 `plugins/`**（onedir 下就是 `dist/DeepSeekHarness/plugins/`，
+由构建脚本从 `dist/plugins/` 镜像过来），一个插件一个子目录：
 
 ```
 dist/
-├── DeepSeekHarness.exe
-└── plugins/
-    ├── gitbash/                     # 内置插件：Windows 上改用 Git Bash
-    │   ├── manifest.json            # id / name / description / order / entry / patch
-    │   ├── cordis.patch.yml         # 要合进 dsh profile 的补丁片段
-    │   ├── gitbash-shell.mjs        # 插件本体（host 半边）
-    │   └── README.md
-    └── usage/                       # 内置插件：token 用量统计
-        ├── manifest.json
-        ├── cordis.patch.yml         # 只插 host 半边
-        ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
-        ├── usage.mjs                # host 半边：采集 + 读取接口
-        ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
-        └── README.md
+├── plugins/                         # 源码，构建时镜像进产物目录
+│   ├── gitbash/                     # 内置插件：Windows 上改用 Git Bash
+│   │   ├── manifest.json            # id / name / description / order / entry / patch
+│   │   ├── cordis.patch.yml         # 要合进 dsh profile 的补丁片段
+│   │   ├── gitbash-shell.mjs        # 插件本体（host 半边）
+│   │   └── README.md
+│   └── usage/                       # 内置插件：token 用量统计
+│       ├── manifest.json
+│       ├── cordis.patch.yml         # 只插 host 半边
+│       ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
+│       ├── usage.mjs                # host 半边：采集 + 读取接口
+│       ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
+│       └── README.md
 ```
 
 **装进 dsh 的规则**（dsh-ui 每次启动、以及管理器点「重启」时执行）：
@@ -167,15 +180,19 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
 
 ## 启动构成 / 启动加速
 
-一次冷启动（真机 exe，`DSH_UI_TIMING=1` 实测）：**进程启动 → 界面开始加载 ≈ 3.6 秒**。
+一次冷启动（真机 onedir exe，`DSH_UI_TIMING=1` 实测）：**进程启动 → 界面开始加载 ≈ 4.2 秒**。
 
 | 阶段 | 耗时 | 说明 |
 | --- | --- | --- |
-| onefile 自解压 + 解释器启动 | 0.53s | 单文件模式的固定开销，用户看不见但躲不掉 |
-| 壳自身（单实例锁 / 图标 / 建窗口 / 托盘 / 起服务） | 0.02s | `service.start()` 本身只要 0.01s |
-| dsh 冷启动 | ≈ 3.6s | 大头，见下 |
+| 壳自身（单实例锁 / 图标 / 建窗口 / 托盘 / 起服务） | 0.03s | `service.start()` 本身只要 0.05s |
+| dsh 冷启动 | ≈ 4.1s | 大头，见下 |
 
-dsh 那 3.6 秒里：
+**打包形态是 onedir，不是 onefile。** 单文件 exe 每次启动都要把自己解压到
+`%TEMP%\_MEIxxxxx`，实测固定多花 **0.65s**（端口 listen 3.35s vs onedir 2.75s），
+而且被强杀 / 崩溃时解压目录不会清理 —— 实测一次排查就攒了 18 个残留共 646MB。
+onedir 没有这一步，代价是产物从 1 个文件变成 160 个（41MB 目录，分发要压 zip）。
+
+dsh 那 4.1 秒里：
 
 - **约 1.5s 是 Node 加载 200 多个包**。试过 `NODE_COMPILE_CACHE`（字节码缓存），
   实测没有收益（4.60s vs 4.51s），已放弃。
@@ -185,13 +202,14 @@ dsh 那 3.6 秒里：
 ### 启动加速补丁（`src/runtime/dsh_fastboot.mjs`）
 
 `dsh-client-modules` 会在**每注册一个插件**时把全部前端 client bundle 重新拼接一遍
-（含逐行生成的 identity sourcemap）。实测一次启动它被调用 **7 次**、合计 **3.0 秒**，
+（含逐行生成的 identity sourcemap）。实测一次启动它被调用 **8 次**、合计 **4.2~4.4 秒**，
 而启动阶段这些产物**没有任何消费者**——前端还没连上来，第一次读取发生在浏览器请求
 首页（`webserver/index-inject`）或 `.js` 产物（`bundleResource`）的时候。
 
 补丁把这四个字段（`composed` / `responses` / `batchResponses` /
 `previousBatchResponses`）改成访问器：启动期间 `compose()` 只记账，**首次被读时才算一次**，
-之后立刻交回 dsh 原逻辑。实测 7 次 → 1 次，真实 exe 的「界面开始加载」从 **4.75s 降到 3.62s**。
+之后立刻交回 dsh 原逻辑。实测 8 次 → 1 次，直连 dsh 的「打印带 token 的 URL」
+从 **6.19s 降到 4.28s**（−31%）。
 
 - **不改 dsh 任何文件**，由 `node --import` 注入，路径写在 `DshService.start()` 里。
 - **只做延迟、不改结果**：首次读取时按完整表格算，结果与不加速时一致；
@@ -223,7 +241,7 @@ dsh 那 3.6 秒里：
 
 ```bat
 set DSH_UI_TIMING=1
-dist\DeepSeekHarness.exe
+dist\DeepSeekHarness\DeepSeekHarness.exe
 ```
 
 对照的耗时构成见上一节。改动启动 / 退出路径后，务必守着上面那条

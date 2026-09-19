@@ -29,6 +29,24 @@ const ENABLED = (process.env.DSH_UI_FASTBOOT ?? "1") !== "0";
 const TARGET = process.env.DSH_FASTBOOT_TARGET;
 const VERBOSE = (process.env.DSH_UI_FASTBOOT_VERBOSE ?? "0") === "1";
 
+// Node 22 的模块编译缓存：dsh 冷启动要编译几 MB 的 ESM bundle，缓存后
+// 二次启动省掉大部分编译时间（V8 code cache 持久化到磁盘）。
+// 失败只是没缓存，绝不影响启动。
+try {
+  const { enableCompileCache } = await import("node:module");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  if (typeof enableCompileCache === "function" && TARGET) {
+    // 缓存目录跟着 dsh 的 node_modules 走（TARGET 指向它的 client-modules 入口），
+    // 升级重装后旧缓存自然失效重建
+    const cacheDir = join(dirname(dirname(fileURLToPath(TARGET))), "dsh-compile-cache");
+    const result = enableCompileCache(cacheDir);
+    say(`编译缓存：${result.status}${result.message ? " " + result.message : ""}`);
+  }
+} catch {
+  /* 老版本 Node 没这个 API，跳过 */
+}
+
 const LAZY_FIELDS = ["composed", "responses", "batchResponses", "previousBatchResponses"];
 
 function say(message) {

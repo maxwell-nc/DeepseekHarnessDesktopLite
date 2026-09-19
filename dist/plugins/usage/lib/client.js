@@ -44,7 +44,12 @@ window.__ModuleLoader__.load({
 			".dshu-dayEmpty{opacity:.5}" +
 			".dshu-dayLabel{margin-top:6px;height:14px;font-size:10px;line-height:14px;text-align:center;color:var(--dsw-alias-label-tertiary,#8a93a8);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden}" +
 			".dshu-tip{position:fixed;z-index:9002;transform:translate(-50%,-100%);margin-top:-10px;padding:8px 11px;border-radius:10px;background:rgba(23,29,44,.95);color:#fff;font-size:12px;line-height:1.75;white-space:nowrap;box-shadow:0 10px 26px rgba(16,24,40,.30);pointer-events:none}" +
-			".dshu-tipRow{display:flex;align-items:center;gap:6px}" +
+			".dshu-tipHead{display:flex;align-items:center;gap:8px;font-weight:600}" +
+			".dshu-tipHeadTotal{margin-left:auto;font-weight:400;color:rgba(255,255,255,.62);font-variant-numeric:tabular-nums}" +
+			".dshu-tipList{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:3px 10px;margin-top:6px}" +
+			".dshu-tipName{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}" +
+			".dshu-tipNum{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}" +
+			".dshu-tipPct{color:rgba(255,255,255,.62);font-variant-numeric:tabular-nums;text-align:right}" +
 			".dshu-tipSwatch{flex:none;width:9px;height:9px;border-radius:2px}" +
 			".dshu-tipDim{color:rgba(255,255,255,.62)}" +
 			".dshu-empty{padding:40px 0;text-align:center;color:var(--dsw-alias-label-tertiary,#8a93a8);font-size:12px;line-height:1.9}" +
@@ -207,19 +212,24 @@ window.__ModuleLoader__.load({
 				...days.map((day) => day.total || 0)
 			);
 			/**
-			 * 弹气泡。占比按**当天**的合计算，不是全期 —— 柱子本来就是「一天一根」，
-			 * 看的是那天各模型怎么分的；拿全期总量当分母，日内的差异会被压成零点几个百分点。
+			 * 弹气泡：显示**这一整天**的全部模型，而不是鼠标底下那一块。
+			 *
+			 * 一行一个模型 —— 色点 + 模型名 + 用量 + 当日占比，四列靠 grid 对齐。
+			 * 占比的分母是**当天**合计（不是全期）：柱子本来就是「一天一根」，
+			 * 看的是那天各模型怎么分的。
 			 */
-			const show = (event, day, modelId, tokens) => {
+			const show = (event, day) => {
 				const rect = event.currentTarget.getBoundingClientRect();
+				const rows = models
+					.map((model) => ({ id: model.id, tokens: day.models[model.id]?.tokens ?? 0 }))
+					.filter((row) => row.tokens > 0)
+					.map((row) => ({ ...row, color: colors.get(row.id) ?? PALETTE[0] }));
 				setTip({
 					x: rect.left + rect.width / 2,
 					y: rect.top,
 					date: day.date,
-					modelId,
-					tokens,
-					color: colors.get(modelId) ?? PALETTE[0],
-					share: formatShare(tokens, day.total)
+					total: day.total || 0,
+					rows
 				});
 			};
 			const hide = () => setTip(null);
@@ -237,9 +247,7 @@ window.__ModuleLoader__.load({
 						style: {
 							height: Math.max(2, (tokens / scale) * 100) + "%",
 							background: colors.get(model.id) ?? PALETTE[0]
-						},
-						onMouseEnter: (event) => show(event, day, model.id, tokens),
-						onMouseLeave: hide
+						}
 					});
 				});
 			};
@@ -252,7 +260,12 @@ window.__ModuleLoader__.load({
 					days.map((day) =>
 						h(
 							"div",
-							{ className: "dshu-col", key: day.date },
+							{
+								className: "dshu-col",
+								key: day.date,
+								onMouseEnter: (event) => show(event, day),
+								onMouseLeave: hide
+							},
 							h("div", { className: "dshu-bar" }, bars(day)),
 							h(
 								"div",
@@ -270,21 +283,30 @@ window.__ModuleLoader__.load({
 					: h(
 							"div",
 							{ className: "dshu-tip", style: { left: tip.x, top: tip.y } },
-							h("div", { className: "dshu-tipRow" }, h("span", { style: { fontWeight: 600 } }, tip.modelId)),
 							h(
 								"div",
-								{ className: "dshu-tipRow" },
-								h("span", { className: "dshu-tipSwatch", style: { background: tip.color } }),
-								h("span", { className: "dshu-tipDim" }, tip.color),
-								h("span", { className: "dshu-tipDim" }, "· 当日占比 " + tip.share)
+								{ className: "dshu-tipHead" },
+								tip.date,
+								tip.total > 0
+									? h("span", { className: "dshu-tipHeadTotal" }, "合计 " + formatAmount(tip.total))
+									: null
 							),
-							h(
-								"div",
-								{ className: "dshu-tipRow" },
-								"用量 ",
-								h("span", { style: { fontWeight: 600 } }, formatAmount(tip.tokens)),
-								h("span", { className: "dshu-tipDim" }, " · " + tip.date)
-							)
+							tip.rows.length > 0
+								? h(
+										"div",
+										{ className: "dshu-tipList" },
+										tip.rows.map((row) =>
+											h(
+												react.Fragment,
+												{ key: row.id },
+												h("span", { className: "dshu-tipSwatch", style: { background: row.color } }),
+												h("span", { className: "dshu-tipName", title: row.id }, row.id),
+												h("span", { className: "dshu-tipNum" }, formatAmount(row.tokens)),
+												h("span", { className: "dshu-tipPct" }, formatShare(row.tokens, tip.total))
+											)
+										)
+									)
+								: h("div", { className: "dshu-tipDim" }, "没有用量")
 						)
 			);
 		}

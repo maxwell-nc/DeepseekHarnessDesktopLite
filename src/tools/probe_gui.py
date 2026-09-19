@@ -67,9 +67,27 @@ while time.time() < deadline:
 if not hwnd:
     print("未找到窗口")
 else:
-    # 等界面加载完
-    time.sleep(20)
-    print("窗口可见 :", bool(user32.IsWindowVisible(hwnd)))
+    # 壳刻意先 hidden、等首屏 HTML 渲染完再显示（不然用户会先看到一片白），
+    # 所以这里轮询等待的是「真的看得见」的那一刻。
+    shown_after = None
+    waited = time.time()
+    while time.time() - waited < 30:
+        if user32.IsWindowVisible(hwnd):
+            shown_after = time.time() - waited
+            break
+        time.sleep(0.2)
+    print("窗口可见 :", shown_after is not None,
+          "（找到句柄后等了 %s）" % ("%.1fs" % shown_after if shown_after is not None else "超时 30s"))
+
+    # 等服务就绪（dsh 冷启动要好几秒），别睡固定时长
+    ready = False
+    waited = time.time()
+    while time.time() - waited < 90:
+        if sh.http_alive():
+            ready = True
+            break
+        time.sleep(0.5)
+    print("服务就绪 :", ready, "（等了 %.1fs）" % (time.time() - waited))
     print("端口占用 :", sh.pids_on_port())
     print("HTTP 可达:", sh.http_alive())
 

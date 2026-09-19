@@ -195,6 +195,227 @@ def report_onefile_extract():
         % (time.perf_counter() - T_START, cost, mei))
 
 
+# --------------------------------------------------------------------------- #
+# 原生 loading（启动期唯一的界面）
+# --------------------------------------------------------------------------- #
+
+# 主窗口里那层原生 loading 的句柄：(panel, tip label)，外加最新状态文字
+_LOADING = {"panels": [], "text": "正在启动本地服务…", "action": None, "armed": False}
+_LOADING_LOCK = threading.Lock()
+
+
+def set_loading_tip(text):
+    """改原生 loading 上那行文字。任意线程可调，异步投递，绝不阻塞调用方。"""
+    text = str(text or "")
+    with _LOADING_LOCK:
+        _LOADING["text"] = text
+        items = list(_LOADING["panels"])
+    action = _LOADING.get("action")
+
+    for panel, label in items:
+
+        def apply(_label=label, _text=text):
+            try:
+                _label.Text = _text
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            if action is not None and panel.InvokeRequired:
+                panel.BeginInvoke(action(apply))
+            else:
+                apply()
+        except Exception as exc:  # noqa: BLE001
+            log("更新原生 loading 文字失败: %s" % exc)
+
+
+def arm_loading_drop():
+    """真实页面（dsh 界面）开始导航了 —— 允许撤掉原生 loading。
+
+    服务没起来之前不能撤：撤了就是一片空窗口，用户既看不到进度也看不到报错。
+    """
+    with _LOADING_LOCK:
+        _LOADING["armed"] = True
+
+
+def patch_webview_loading():
+    """主窗口一出来就显示**原生** loading，WebView2 在它底下并行初始化。
+
+    启动期唯一的界面就是这一层：应用名 + 进度条 + 一行状态（状态文字由
+    ``set_loading_tip`` 从服务线程实时更新）。等 dsh 页面真正加载完
+    （``arm_loading_drop()`` 之后再收到 NavigationCompleted）才撤掉，露出真页面。
+
+    两个必须记住的坑：
+
+    1. **先把 WebView2 控件设成不可见。** 它是带 HWND 的子窗口，WinForms 那些没有
+       句柄的控件（Panel / Label / ProgressBar）按 airspace 规则永远画不到它上面，
+       z-order 和 BringToFront 都救不了 —— 不藏掉的话这层 loading 铺了也看不见
+       （实测中部非底色像素占比 0.000）。只藏控件不藏窗口：内核初始化和导航照常跑。
+    2. **不要另开小窗。** pywebview 的 ``setup_app()`` 要求在任何窗体之前调用
+       ``SetCompatibleTextRenderingDefault``，抢先建窗体会让整个 GUI 起不来。
+       原生控件长在主窗口里就没有这个顺序问题。
+    """
+    try:
+        import clr as _clr
+
+        _clr.AddReference("System.Drawing")
+        from System import Action  # noqa: PLC0415
+        from System.Drawing import (  # noqa: PLC0415
+            ColorTranslator,
+            ContentAlignment,
+            Font,
+            FontStyle,
+            Point,
+            Size,
+        )
+        from webview.platforms import edgechromium  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        log("跳过原生 loading：%s" % exc)
+        return
+
+    _LOADING["action"] = Action
+    real_init = edgechromium.EdgeChrome.__init__
+    if getattr(real_init, "_dsh_loading", False):
+        return
+
+    def make_font(size, bold=False):
+        for name in ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"):
+            try:
+                return Font(name, size, FontStyle.Bold if bold else FontStyle.Regular)
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def patched(self, form, window, cache_dir):
+        real_init(self, form, window, cache_dir)
+        # 只给主窗口铺这一层：插件管理器窗口是隐藏建好、点开才显示的，它有自己的
+        # HTML，不需要这层（铺上反而要等 120s 兜底才撤）。
+        if getattr(window, "uid", None) != "master":
+            return
+        try:
+            WinForms = edgechromium.WinForms
+            value = (window.background_color or "").lstrip("#")
+            color = edgechromium.Color.FromArgb(
+                255, int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+            )
+
+            self.webview.Visible = False      # 见上面第 1 条：不藏就看不见
+
+            panel = WinForms.Panel()
+            panel.Dock = WinForms.DockStyle.Fill
+            panel.BackColor = color
+
+            # 内容块固定尺寸，靠 panel 的 Resize 居中——省掉 Dock 先后次序的坑
+            box = WinForms.Panel()
+            box.Size = Size(560, 132)
+            box.BackColor = color
+
+            title = WinForms.Label()
+            title.Text = APP_NAME
+            title.Location = Point(0, 12)
+            title.Size = Size(560, 44)
+            title.TextAlign = ContentAlignment.MiddleCenter
+            title.ForeColor = ColorTranslator.FromHtml("#1b2130")
+            title.BackColor = color
+            title.Font = make_font(16.0, True) or title.Font
+
+            bar = WinForms.ProgressBar()
+            bar.Style = WinForms.ProgressBarStyle.Marquee
+            bar.MarqueeAnimationSpeed = 25
+            bar.Location = Point(160, 70)
+            bar.Size = Size(240, 6)
+
+            tip = WinForms.Label()
+            tip.Location = Point(0, 88)
+            tip.Size = Size(560, 32)
+            tip.TextAlign = ContentAlignment.MiddleCenter
+            tip.ForeColor = ColorTranslator.FromHtml("#6b7488")
+            tip.BackColor = color
+            tip.Font = make_font(10.5) or tip.Font
+            with _LOADING_LOCK:
+                tip.Text = _LOADING["text"]
+
+            box.Controls.Add(title)
+            box.Controls.Add(bar)
+            box.Controls.Add(tip)
+
+            def recenter(_sender=None, _args=None):
+                try:
+                    box.Location = Point(
+                        max(0, (panel.ClientSize.Width - box.Width) // 2),
+                        max(0, (panel.ClientSize.Height - box.Height) // 2 - 24),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            panel.Resize += recenter
+            panel.Controls.Add(box)
+            form.Controls.Add(panel)
+            panel.BringToFront()
+            recenter()
+            mark("原生 loading 已铺上（WebView2 在底下并行初始化）")
+
+            with _LOADING_LOCK:
+                _LOADING["panels"].append((panel, tip))
+
+            dropped = []
+            action = _LOADING["action"]
+
+            def drop(force=False):
+                if dropped:
+                    return
+                if not force:
+                    with _LOADING_LOCK:
+                        if not _LOADING["armed"]:
+                            return      # 真实页面还没开始导航，继续等
+                dropped.append(1)
+                with _LOADING_LOCK:
+                    for item in list(_LOADING["panels"]):
+                        if item[0] is panel:
+                            _LOADING["panels"].remove(item)
+
+                def remove():
+                    try:
+                        self.webview.Visible = True      # 先亮页面，再撤挡板
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        form.Controls.Remove(panel)
+                        panel.Dispose()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                try:
+                    # NavigationCompleted 在 UI 线程，兜底定时器不在 —— 都 marshal 过去
+                    if action is not None and panel.InvokeRequired:
+                        panel.BeginInvoke(action(remove))
+                    else:
+                        remove()
+                except Exception:  # noqa: BLE001
+                    pass
+                mark("原生 loading 已撤（页面已加载）")
+
+            def on_nav(*_args):
+                # 注意：这里的 self 是 EdgeChrome 实例，不是 DshShellApp
+                try:
+                    src = str(self.webview.Source or "")
+                except Exception:  # noqa: BLE001
+                    return
+                # 认准 dsh 那个端口：初始空白页也可能触发 NavigationCompleted
+                if (":%d" % PORT) not in src:
+                    return
+                drop()
+
+            self.webview.NavigationCompleted += on_nav
+            # 兜底：万一页面一直没加载完，也不能永远挡着（首次 npm 安装可能很久）
+            threading.Timer(120.0, lambda: drop(force=True)).start()
+        except Exception as exc:  # noqa: BLE001
+            log("铺原生 loading 失败: %s\n%s" % (exc, traceback.format_exc()))
+
+    patched._dsh_loading = True
+    edgechromium.EdgeChrome.__init__ = patched
+
+
 def _setup_logging():
     try:
         handler = logging.FileHandler(SHELL_LOG, encoding="utf-8")
@@ -1199,7 +1420,8 @@ class DshService(object):
         while time.time() - start_at < timeout:
             if should_abort is not None and should_abort():
                 return False
-            if self.web_url and http_alive():
+            alive = http_alive()
+            if self.web_url and alive:
                 return True
             with self._lock:
                 proc = self._proc
@@ -1209,7 +1431,7 @@ class DshService(object):
                     poll_log(self.read_service_tail())
                 return False
             # 端口通了但还没打印出 token 时，给个提示
-            if not announced and http_alive():
+            if not announced and alive:
                 announced = True
                 log("端口已就绪，等待 dsh 输出访问地址")
             # 小步快跑：dsh 打印 token 之后最多再等 0.15s 就能接上，
@@ -1232,85 +1454,14 @@ class DshService(object):
 # 启动页
 # --------------------------------------------------------------------------- #
 
-SPLASH_HTML = """<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>DeepSeek Harness</title>
-<style>
-  html, body { height: 100%; margin: 0; }
-  body {
-    display: flex; align-items: center; justify-content: center;
-    background: radial-gradient(circle at 50% 26%, #ffffff 0%, #eef2fb 62%, #e2e9f7 100%);
-    color: #1b2130; font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    -webkit-user-select: none; user-select: none; overflow: hidden;
-  }
-  .wrap { width: 620px; padding: 40px; text-align: center; }
-  .logo {
-    width: 84px; height: 84px; margin: 0 auto 26px;
-    border-radius: 26px;
-    background: linear-gradient(135deg, #4d6bfe 0%, #283ebe 100%);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 46px; font-weight: 700; color: #fff;
-    box-shadow: 0 16px 36px rgba(77, 107, 254, .28);
-  }
-  h1 { margin: 0 0 10px; font-size: 21px; font-weight: 600; letter-spacing: .3px; color: #141a27; }
-  #status { margin: 0; font-size: 14px; color: #5b6478; min-height: 20px; }
-  #detail {
-    margin: 14px auto 0; font-size: 12px; color: #8a93a8;
-    max-width: 520px; line-height: 1.7; word-break: break-all;
-    font-family: Consolas, "Cascadia Mono", monospace;
-  }
-  .spinner {
-    margin: 22px auto 0; width: 22px; height: 22px;
-    border: 2.5px solid rgba(77, 107, 254, .18);
-    border-top-color: #4d6bfe; border-radius: 50%;
-    animation: spin .8s linear infinite;
-  }
-  .spinner.done { animation: none; border-color: rgba(17, 158, 106, .32); border-top-color: #119e6a; }
-  .spinner.err { animation: none; border-color: rgba(214, 60, 76, .35); border-top-color: #d63c4c; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  #tail {
-    margin: 18px auto 0; padding: 12px 14px; max-width: 560px; max-height: 150px;
-    overflow: hidden; text-align: left; font-size: 11px; line-height: 1.65;
-    color: #5f6880; background: #fff;
-    border: 1px solid rgba(22, 32, 58, .10); border-radius: 10px;
-    font-family: Consolas, "Cascadia Mono", monospace; white-space: pre-wrap;
-    word-break: break-all; display: none; -webkit-user-select: text; user-select: text;
-  }
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="logo">D</div>
-    <h1>DeepSeek Harness</h1>
-    <p id="status">正在准备…</p>
-    <div class="spinner" id="spinner"></div>
-    <div id="detail"></div>
-    <div id="tail"></div>
-  </div>
-<script>
-  window.__setStatus = function (text, detail, kind) {
-    document.getElementById('status').textContent = text || '';
-    document.getElementById('detail').textContent = detail || '';
-    var sp = document.getElementById('spinner');
-    sp.className = 'spinner' + (kind ? ' ' + kind : '');
-  };
-  window.__setTail = function (text) {
-    var el = document.getElementById('tail');
-    if (!text) { el.style.display = 'none'; el.textContent = ''; return; }
-    el.style.display = 'block';
-    el.textContent = String(text).slice(-1600);
-  };
-</script>
-</body>
-</html>
+# 启动期窗口里必须有个页面给 WebView2，但用户看的是原生 loading 那层，
+# 所以这里只放一个和窗口同色的空白页（原生层出问题时也不会闪白）。
+BLANK_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>DeepSeek Harness</title>
+<style>html,body{margin:0;height:100%;background:#f4f6fb}</style></head>
+<body></body></html>
 """
 
-
-# --------------------------------------------------------------------------- #
-# 插件管理器窗口
-# --------------------------------------------------------------------------- #
 
 MANAGER_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -1539,62 +1690,31 @@ class DshShellApp(object):
         self.icon = None
         self.quitting = False
         self.busy = threading.Lock()
-        self._splash_loaded = threading.Event()
         # 插件管理器窗口底部那行状态文字
         self.plugin_status = ""
         self.plugin_error = False
-        # 启动页状态投递器。evaluate_js 会同步 Invoke 到 UI 线程，而程序刚起来时
-        # 主线程正忙着初始化 WebView2（实测约 3 秒），直接在调用方发就会白等这几秒，
-        # 连 service.start() 都被一起推迟。所以这里只存"最新一条"，由后台线程慢慢发。
-        self._ui_lock = threading.Lock()
-        self._ui_pending = None
-        self._ui_worker = None
 
     def set_plugin_status(self, text, error=False):
         self.plugin_status = str(text or "")
         self.plugin_error = bool(error)
 
-    # ---------------- 启动页状态 ---------------- #
+    # ---------------- 启动状态（写在那层原生 loading 上） ---------------- #
 
     def set_status(self, text, detail="", kind=""):
-        self._post_ui(
-            "window.__setStatus && window.__setStatus(%s, %s, %s);"
-            % (js_str(text), js_str(detail), js_str(kind))
-        )
+        """启动期唯一那层界面就是原生 loading，状态文字直接写上去。
+
+        不再走 evaluate_js：那会同步 Invoke 到 UI 线程，程序刚起来时主线程正忙着
+        初始化 WebView2（实测约 3 秒），会把 service.start() 一起堵住。原生控件
+        那边是 BeginInvoke，异步、不阻塞调用方。
+        """
+        set_loading_tip(text)
+        if detail:
+            log("状态[%s]: %s | %s" % (kind or "-", text, detail))
 
     def set_tail(self, text):
-        self._post_ui("window.__setTail && window.__setTail(%s);" % js_str(text))
-
-    def _post_ui(self, script):
-        """把要执行的 JS 丢给后台线程串行发送，调用方立即返回。"""
-        with self._ui_lock:
-            self._ui_pending = script          # 旧状态直接丢掉，只保留最新一条
-            if self._ui_worker is not None:
-                return
-            worker = threading.Thread(target=self._ui_pump, daemon=True)
-            self._ui_worker = worker
-        worker.start()
-
-    def _ui_pump(self):
-        while True:
-            with self._ui_lock:
-                script = self._ui_pending
-                self._ui_pending = None
-                if script is None:
-                    self._ui_worker = None
-                    return
-            self._eval(script)
-
-    def _eval(self, script):
-        window = self.window
-        if window is None:
-            return
-        for _ in range(4):
-            try:
-                window.evaluate_js(script)
-                return
-            except Exception:
-                time.sleep(0.35)
+        """dsh / npm 的输出行：没有启动页可显示了，只进日志。"""
+        if text:
+            log("tail: %s" % text)
 
     def notify(self, message, title=None):
         try:
@@ -1819,6 +1939,7 @@ class DshShellApp(object):
         url = self.service.access_url
         try:
             log("加载界面：%s" % url)
+            arm_loading_drop()          # 真页面开始导航了，允许撤掉原生 loading
             window.load_url(url)
         except Exception as exc:  # noqa: BLE001
             log("加载界面失败: %s" % exc)
@@ -2102,9 +2223,12 @@ def main():
 
     app = DshShellApp()
 
+    # 启动期唯一的界面 = 主窗口里那层原生 loading，必须在 webview.start() 之前挂上。
+    patch_webview_loading()
+
     window = webview.create_window(
         APP_NAME,
-        html=SPLASH_HTML,
+        html=BLANK_HTML,
         width=1280,
         height=860,
         min_size=(940, 620),
@@ -2113,6 +2237,7 @@ def main():
     )
     app.window = window
     window.events.closing += app.on_window_closing
+    window.events.loaded += lambda: mark("页面加载完成")
     mark("主窗口对象已建（尚未真正创建 WebView2）")
 
     # 插件管理器：先建好、隐藏着，托盘菜单点开再 show()。
