@@ -892,6 +892,25 @@ def sync_plugins(on_note=None):
 # --------------------------------------------------------------------------- #
 
 
+def bundled_node_dir():
+    """产物自带的 Node 目录：exe 同目录的 node/。开发态回落到项目里的 dist/node。
+
+    只有 node.exe 真的在才算数：目录在、exe 不在（手工解压放了一半）一律当没有，
+    好让 find_node() 干净地回退到系统 Node。DSH_UI_NODE_DIR 可整体指向别处，
+    对应 plugins_dir() 的 DSH_UI_PLUGINS_DIR。
+    """
+    override = (os.environ.get("DSH_UI_NODE_DIR") or "").strip()
+    if override:
+        base = os.path.abspath(os.path.expanduser(override))
+    elif getattr(sys, "frozen", False):
+        base = os.path.join(BASE_DIR, "node")
+    else:
+        base = os.path.join(os.path.dirname(BASE_DIR), "dist", "node")
+    if os.path.isfile(os.path.join(base, "node.exe")):
+        return base
+    return None
+
+
 def _node_dirs():
     out = []
 
@@ -919,7 +938,7 @@ _node_cache = []
 
 
 def find_node(refresh=False):
-    """找到 node.exe。优先 PATH，其次常见安装位置。
+    """找到 node.exe。优先产物自带的 node/，其次 PATH，最后常见安装位置。
 
     结果会缓存：启动路径上 ``main()`` 和 ``DshService.start()`` 各要一次，
     而 ``shutil.which`` 遍历一遍 PATH 实测近 90ms。想重新探测（比如刚装完 Node）
@@ -927,7 +946,11 @@ def find_node(refresh=False):
     """
     if _node_cache and not refresh:
         return _node_cache[0]
-    found = shutil.which("node")
+    bundled = bundled_node_dir()
+    if bundled:
+        found = os.path.join(bundled, "node.exe")
+    else:
+        found = shutil.which("node")
     if not found:
         for folder in _node_dirs():
             candidate = os.path.join(folder, "node.exe")
@@ -1187,8 +1210,9 @@ class DshService(object):
         node_exe = find_node()
         if not node_exe:
             return False, (
-                "未检测到 Node.js。请先安装 Node.js 18 或更高版本（https://nodejs.org），"
-                "然后重新启动本程序。"
+                "未检测到可用的 Node.js：产物内的 node/ 目录缺失，系统里也没找到 Node。"
+                "请重新获取完整发行包（应包含 node/ 目录），"
+                "或自行安装 Node.js 18 或更高版本（https://nodejs.org），然后重新启动本程序。"
             )
 
         npm_cli = find_npm_cli(node_exe)
@@ -1291,7 +1315,10 @@ class DshService(object):
                 return True
             node_exe = _timed("find_node()", find_node)
             if not node_exe:
-                raise RuntimeError("未检测到 Node.js，请先安装 Node.js 18+")
+                raise RuntimeError(
+                    "未检测到 Node.js：产物内的 node/ 目录缺失，系统也未安装。"
+                    "请重新获取完整发行包，或安装 Node.js 18+"
+                )
             entry = _timed("entry_script()", self.entry_script)
             if not os.path.isfile(entry):
                 raise RuntimeError("DeepSeek Harness 尚未安装完整：%s" % entry)

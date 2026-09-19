@@ -6,6 +6,8 @@
 ## 特性
 
 - **WebView2 内核**：用系统自带的 Edge WebView2 渲染界面，不依赖外部浏览器
+- **自带 Node 运行时**：产物内置 Node 26（exe 同目录 `node/`），用户机器不用另装 Node；
+  该目录缺失时才回退到系统 Node
 - **亮色界面**：启动页与插件管理器都是亮色主题（底色 `#f4f6fb`，DeepSeek 蓝强调色 `#4d6bfe`）
 - **无命令行窗口**：打包为 windowed onedir 目录（`exe` + `_internal/`），服务进程用
   `CREATE_NO_WINDOW` 静默拉起
@@ -36,11 +38,11 @@ src/                         代码（含构建、打包、自测）
     └── probe_plugin_manager.py  插件管理器窗口 + js_api 桥 + 红绿灯渲染
 
 build/                       PyInstaller 工作目录 + Python 字节码缓存（build/pycache）
-dist/
+dist/                        整个目录就是程序目录，一起分发
+├── DeepSeekHarness.exe      启动器
+├── _internal/               Python 运行时 + 依赖 + runtime/dsh_fastboot.mjs
 ├── plugins/                 插件源码，进版本库
-└── DeepSeekHarness/         onedir 产物（整个目录一起分发），里面自动镜像一份 plugins/
-    ├── DeepSeekHarness.exe
-    └── _internal/
+└── node/                    自带的 Node 26（win-x64 zip 摊平），不进版本库
 ```
 
 `.pyc` 不走源码目录：`dsh_shell.py` / `build.py` / `tools/*.py` 都设了 `sys.pycache_prefix`，
@@ -60,20 +62,27 @@ python -m venv .venv
 产物（onedir，不是一个单文件）：
 
 ```
-dist/DeepSeekHarness/
+dist/                        整个目录就是程序目录
 ├── DeepSeekHarness.exe      启动器，不能单独拷出来用
 ├── _internal/               Python 运行时 + 依赖 + runtime/dsh_fastboot.mjs
-└── plugins/                 由构建脚本从 dist/plugins/ 镜像过来
+├── plugins/                 插件源码（运行时直接读这份）
+└── node/                    自带的 Node 26
 ```
 
-**分发要把整个 `dist/DeepSeekHarness/` 压成 zip。**
+**分发要把整个 `dist/` 压成 zip。**
 
-插件按**源码**放在 `dist/plugins/`（进版本库），**不打包进 exe**；构建时镜像进产物目录。
+插件按**源码**放在 `dist/plugins/`（进版本库），**不打包进 exe**。
+
+自带 Node 要**手工准备**（构建脚本不下载）：从 nodejs.org 下 win-x64 的 zip，把解压出来的
+`node-v26.x.x-win-x64/` **里面的内容**（`node.exe`、`node_modules/`、`npm.cmd` 等）直接铺到
+`dist/node/` 下 —— 要摊平，别留一层版本号目录。`src/build.py` 只检查 `dist/node/node.exe`
+在不在并给警告，不会替你下载。`dist/node/` 被 `.gitignore` 的 `dist/*` 规则忽略，不进版本库。
 
 ## 运行前提
 
 - Windows 10/11，已安装 **WebView2 运行时**（Win11 与近期 Win10 一般自带）
-- **Node.js 18+**（`node` 需在 PATH 中，或装在常见默认位置）
+- **不用单独装 Node**：产物自带 Node 26（`dist/node/`）。只有该目录缺失时才回退到系统
+  Node —— `PATH` 里找 `node`，再找常见安装位置（此时才需要 **Node.js 18+**）
 
 首次启动会自动在数据目录里 `npm install @deepseek-ai/dsh`（依赖约 520 个包、
 2.3 万个文件，首次需要几分钟，之后走缓存会快很多）。
@@ -102,12 +111,12 @@ dist/DeepSeekHarness/
 
 ## 插件
 
-插件包放在 **exe 同目录的 `plugins/`**（onedir 下就是 `dist/DeepSeekHarness/plugins/`，
-由构建脚本从 `dist/plugins/` 镜像过来），一个插件一个子目录：
+插件包放在 **exe 同目录的 `plugins/`**（onedir 下就是 `dist/plugins/`，
+壳运行时直接读这份，构建脚本不搬运），一个插件一个子目录：
 
 ```
 dist/
-├── plugins/                         # 源码，构建时镜像进产物目录
+├── plugins/                         # 源码，同时也是运行时目录
 │   ├── gitbash/                     # 内置插件：Windows 上改用 Git Bash
 │   │   ├── manifest.json            # id / name / description / order / entry / patch
 │   │   ├── cordis.patch.yml         # 要合进 dsh profile 的补丁片段
@@ -180,36 +189,56 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
 
 ## 启动构成 / 启动加速
 
-一次冷启动（真机 onedir exe，`DSH_UI_TIMING=1` 实测）：**进程启动 → 界面开始加载 ≈ 4.2 秒**。
+一次冷启动（真机 onedir exe，`DSH_UI_TIMING=1` 实测）：**进程启动 → 界面开始加载 ≈ 3.4 秒**。
+
+同一套产物下把 `dist/node/` 撤掉、回退到系统 Node 22.23.2，同一个打点会变成 **≈ 4.4 秒** ——
+自带 Node 26 在这里省了约 1.0 秒（−22%）。各测 3 次：3.351 / 3.414 / 3.519s（自带）对
+4.408 / 4.462 / 4.286s（系统 22）。
 
 | 阶段 | 耗时 | 说明 |
 | --- | --- | --- |
-| 壳自身（单实例锁 / 图标 / 建窗口 / 托盘 / 起服务） | 0.03s | `service.start()` 本身只要 0.05s |
-| dsh 冷启动 | ≈ 4.1s | 大头，见下 |
+| exe 自举 + 壳自身（单实例锁 / 图标 / 建窗口 / 托盘 / 起服务） | ≈ 0.44s | PyInstaller 起运行时占大头，`service.start()` 本身只要 0.016s |
+| dsh 冷启动 | ≈ 3.0s | 大头，见下 |
 
 **打包形态是 onedir，不是 onefile。** 单文件 exe 每次启动都要把自己解压到
 `%TEMP%\_MEIxxxxx`，实测固定多花 **0.65s**（端口 listen 3.35s vs onedir 2.75s），
 而且被强杀 / 崩溃时解压目录不会清理 —— 实测一次排查就攒了 18 个残留共 646MB。
-onedir 没有这一步，代价是产物从 1 个文件变成 160 个（41MB 目录，分发要压 zip）。
+onedir 没有这一步，代价是产物从 1 个文件变成一个目录（159MB，其中自带 Node 占 107MB，
+分发要压 zip）。
 
-dsh 那 4.1 秒里：
+dsh 那 3.0 秒里：
 
-- **约 1.5s 是 Node 加载 200 多个包**。试过 `NODE_COMPILE_CACHE`（字节码缓存），
-  实测没有收益（4.60s vs 4.51s），已放弃。
-- **约 0.8s 是拼接前端 client bundle**。原本这里是 **3.0 秒** —— 见下。
+- **约 1.5s 是 Node 加载 200 多个包**。Node 版本对这个数字影响很大 —— 见下。
+- **约 0.6s 是拼接前端 client bundle**（延迟到首次被读时才算的那一次）。
+  不加速的话这一步要重复 10 次、合计 **2.5 秒以上** —— 见下。
 - 其余是插件加载、起 HTTP 服务、打印 token。
+
+### Node 版本：自带 26，不是系统 22
+
+补丁之后，dsh 冷启动的瓶颈就落到 Node 本身。直连 dsh 测「spawn → 打印带 token 的 URL」
+（各 5 次，都开补丁）：
+
+| Node | 耗时 |
+| --- | --- |
+| 22.23.2 | 3.66s |
+| 24.21.0 LTS | 3.29s |
+| **26.9.0（产物自带）** | **2.50s** |
+
+所以产物自带 Node 26（`dist/node/`，win-x64 zip 摊平），`find_node()` 自带优先、系统兜底。
+自带的这份不调 `module.enableCompileCache`，Node 26 也不默认开 —— 提速来自 V8 / 模块加载
+本身，不需要任何配置。
 
 ### 启动加速补丁（`src/runtime/dsh_fastboot.mjs`）
 
 `dsh-client-modules` 会在**每注册一个插件**时把全部前端 client bundle 重新拼接一遍
-（含逐行生成的 identity sourcemap）。实测一次启动它被调用 **8 次**、合计 **4.2~4.4 秒**，
+（含逐行生成的 identity sourcemap）。实测一次启动它被调用 **10 次**，
 而启动阶段这些产物**没有任何消费者**——前端还没连上来，第一次读取发生在浏览器请求
 首页（`webserver/index-inject`）或 `.js` 产物（`bundleResource`）的时候。
 
 补丁把这四个字段（`composed` / `responses` / `batchResponses` /
 `previousBatchResponses`）改成访问器：启动期间 `compose()` 只记账，**首次被读时才算一次**，
-之后立刻交回 dsh 原逻辑。实测 8 次 → 1 次，直连 dsh 的「打印带 token 的 URL」
-从 **6.19s 降到 4.28s**（−31%）。
+之后立刻交回 dsh 原逻辑。实测 10 次 → 1 次，直连 dsh 的「打印带 token 的 URL」
+从 **5.04s 降到 2.50s**（Node 26；Node 22 上是 4.44s → 3.66s）。
 
 - **不改 dsh 任何文件**，由 `node --import` 注入，路径写在 `DshService.start()` 里。
 - **只做延迟、不改结果**：首次读取时按完整表格算，结果与不加速时一致；
@@ -217,6 +246,9 @@ dsh 那 4.1 秒里：
   任何异常都只意味着「没加速」。
 - **开关**：`DSH_UI_FASTBOOT=0` 关闭；`DSH_UI_TIMING=1` 时补丁会把
   「跳过 N 次 / 实际算 1 次花多久」写进 `service.log`。
+- **顺带说一个负面结果**：补丁里曾经还有一段 `module.enableCompileCache()`（字节码缓存），
+  实测它建的 `dsh-compile-cache` 目录始终是 **0 个文件**、开关前后耗时也没有差异
+  （4.60s vs 4.51s），已从 `dsh_fastboot.mjs` 里删掉。别再往回加。
 - **验证结论**：补丁前后各抓一次首页 `window.__DSH_BOOT__` 里的产物做逐字节比对 ——
   dsh 每次启动会混入随机 nonce，产物字节本来就不可能完全一致，所以比对前先归一化；
   归一化后实测 55 份产物里 54 份字节完全相同，只有那个 11MB 的批量包拼接顺序会变
@@ -241,7 +273,7 @@ dsh 那 4.1 秒里：
 
 ```bat
 set DSH_UI_TIMING=1
-dist\DeepSeekHarness\DeepSeekHarness.exe
+dist\DeepSeekHarness.exe
 ```
 
 对照的耗时构成见上一节。改动启动 / 退出路径后，务必守着上面那条

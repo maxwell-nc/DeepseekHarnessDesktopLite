@@ -19,8 +19,12 @@ def step(title):
 
 
 step("1. 环境定位")
+bundled = sh.bundled_node_dir()
 node = sh.find_node()
+print("自带 node     :", bundled)
 print("node          :", node)
+print("node 来源     :", "自带" if bundled and node
+      and os.path.dirname(node) == bundled else "系统 / PATH")
 print("npm-cli       :", sh.find_npm_cli(node))
 print("runtime dir   :", sh.RUNTIME_DIR)
 

@@ -6,8 +6,9 @@
  * ----
  * dsh 的 `@deepseek-ai/dsh-client-modules` 会在**每注册一个插件**时，把全部前端
  * client bundle 重新拼接一遍（含逐行生成的 identity sourcemap）。实测一次启动里
- * 它被调用 7 次，合计约 3.0 秒，占 dsh 冷启动（约 5.3 秒）的一半以上；而启动阶段
- * 这些产物**没有任何消费者**——前端还没连上来。
+ * 它被调用 10 次，而启动阶段这些产物**没有任何消费者**——前端还没连上来，
+ * 第一次读取发生在浏览器请求首页或 .js 产物的时候。实测（Node 26，dsh 0.1.5-rc.2）
+ * 补丁前后 5.04s → 2.50s，省掉的那 9 次重复组合占 2.5 秒以上。
  *
  * 做法
  * ----
@@ -28,24 +29,6 @@ const MARK = "[dsh-fastboot]";
 const ENABLED = (process.env.DSH_UI_FASTBOOT ?? "1") !== "0";
 const TARGET = process.env.DSH_FASTBOOT_TARGET;
 const VERBOSE = (process.env.DSH_UI_FASTBOOT_VERBOSE ?? "0") === "1";
-
-// Node 22 的模块编译缓存：dsh 冷启动要编译几 MB 的 ESM bundle，缓存后
-// 二次启动省掉大部分编译时间（V8 code cache 持久化到磁盘）。
-// 失败只是没缓存，绝不影响启动。
-try {
-  const { enableCompileCache } = await import("node:module");
-  const { fileURLToPath } = await import("node:url");
-  const { dirname, join } = await import("node:path");
-  if (typeof enableCompileCache === "function" && TARGET) {
-    // 缓存目录跟着 dsh 的 node_modules 走（TARGET 指向它的 client-modules 入口），
-    // 升级重装后旧缓存自然失效重建
-    const cacheDir = join(dirname(dirname(fileURLToPath(TARGET))), "dsh-compile-cache");
-    const result = enableCompileCache(cacheDir);
-    say(`编译缓存：${result.status}${result.message ? " " + result.message : ""}`);
-  }
-} catch {
-  /* 老版本 Node 没这个 API，跳过 */
-}
 
 const LAZY_FIELDS = ["composed", "responses", "batchResponses", "previousBatchResponses"];
 
