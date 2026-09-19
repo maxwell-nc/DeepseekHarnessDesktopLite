@@ -1,0 +1,17 @@
+{
+  "name": "dsh-lan-access",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh 局域网访问插件（host 半边：带鉴权的反向代理 + 二维码接口；Web 客户端半边：侧边栏入口与面板）",
+  "exports": {
+    ".": "./lan_access.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

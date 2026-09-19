@@ -122,12 +122,21 @@ dist/
 │   │   ├── cordis.patch.yml         # 要合进 dsh profile 的补丁片段
 │   │   ├── gitbash-shell.mjs        # 插件本体（host 半边）
 │   │   └── README.md
-│   └── usage/                       # 内置插件：token 用量统计
+│   ├── usage/                       # 内置插件：token 用量统计
 │       ├── manifest.json
 │       ├── cordis.patch.yml         # 只插 host 半边
 │       ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
 │       ├── usage.mjs                # host 半边：采集 + 读取接口
 │       ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
+│       └── README.md
+│   └── lan_access/                  # 内置插件：局域网扫码访问
+│       ├── manifest.json
+│       ├── cordis.patch.yml         # 只插 host 半边（刻意不改 webserver 的 host）
+│       ├── package.json
+│       ├── lan_access.mjs           # host 半边：访问码/开关落盘 + 起停代理 + 读取/开关/重置接口
+│       ├── lib/proxy.mjs            # 带鉴权的反向代理（HTTP + WebSocket）
+│       ├── lib/qr.mjs               # 纯 JS 二维码编码器 → SVG
+│       ├── lib/client.js            # 浏览器半边：侧边栏入口（独占一行）+ 二维码/开关面板
 │       └── README.md
 ```
 
@@ -172,6 +181,33 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
   浏览器半边（`lib/client.js`）靠 `package.json` 里的 `dsh.client` 被
   `dsh-client-modules` 自动发现，**不用写进补丁**。
 - 细节与设计取舍见 [dist/plugins/usage/README.md](dist/plugins/usage/README.md)。
+
+### 内置：`lan_access`
+
+让手机在**同一个局域网里扫码打开网页版**。界面上同样在**左下角、设置按钮上方**多一个入口
+（**独占一行**，不和 `usage` 挤在同一行），点开是二维码 + 一条链接；手机上扫码就能用，
+功能与电脑上一致。
+
+- **默认关闭、开了就记住**：插件装上后入口就在，但 3081 端口**不监听** —— 局域网通道等于
+  把本机的操作权限摊到网上，不能默认开着。面板里点「开启局域网访问」才起代理，开关状态和
+  访问码存在一起，下次启动自动恢复；点「关闭」端口立刻释放。
+- **链接固定**：`http://<内网IP>:3081/?lan=<访问码>`。访问码 16 字节随机、只生成一次，
+  落在 `%LOCALAPPDATA%\DeepSeekHarness\data\lan_access.json`，所以**只要内网 IP 不变，
+  链接和二维码就不变**（IP 变了链接跟着变，这是内网地址本身的性质）。端口写死 3081：
+  端口一变链接就变，被占用时宁可报错也不换（面板会显示原因并给「重试」）。
+- **不动 dsh 的绑定**：dsh 依旧只监听 `127.0.0.1:3080`。上游把 `--host 0.0.0.0` 明确堵死了
+  （`dsh-web-app` 的 startup 里写着「会把 RCE 暴露到网络」），插件改成**自己在局域网侧起一个
+  带鉴权的反向代理**，暴露面完全由插件控制 —— 关掉开关端口就释放，关掉插件更是一点不留。
+- **两层鉴权**：局域网侧是固定访问码（`?lan=` → 长期 cookie）；回环侧是 dsh 自己的会话 cookie，
+  由代理用进程 launch token 自己完成登录跳转换好后代持，**浏览器全程不接触 dsh 的 token/cookie**。
+  默认只放行内网/回环来源；面板上可一键**重置访问码**，旧链接立即失效。
+- **WebSocket 也走代理**：对话流不是 SSE，而是 `/api/remote.mux` 上的 WebSocket
+  （`dsh-api-gateway` 注册的 Upgrade 路由，握手时同样过 dsh 的 Host/Origin 围栏 + cookie 鉴权）。
+  代理用 `net.connect` 原样转发握手，少了这一段页面能开但一发消息就废。
+- **二维码在宿主侧生成**（`lib/qr.mjs`，纯 JS 编码器，无依赖），前端只负责显示 ——
+  浏览器半边不用为了显示一张图多背几百行编码器。
+- 首次连不上多半是 **Windows 防火墙**拦了入站，要放行本程序自带的 `node.exe`（私有网络）；
+  更多坑与设计取舍见 [dist/plugins/lan_access/README.md](dist/plugins/lan_access/README.md)。
 
 ## 两个容易踩的坑
 
@@ -262,9 +298,18 @@ dsh 那 3.0 秒里：
 # 想不碰真实环境，指向临时目录：
 <venv>/Scripts/python.exe src/tools/probe_plugins.py \
     --plugins-dir <临时插件目录> --dsh-home <临时 dsh 目录>
+
+<venv>/Scripts/python.exe src/tools/probe_lan_access.py          # 局域网访问插件
 ```
 
 `probe_gui.py` 可以带一个参数：不传跑源码，传 exe 路径就测打包产物。
+
+`probe_lan_access.py` 只负责找 node、把插件目录传给
+`src/tools/probe_lan_access_checks.mjs`（检查本体是 JS）。它**不碰真实环境**：
+假上游是现起的 node:http，状态文件指向临时目录，代理只绑 `127.0.0.1` + 临时端口。
+覆盖二维码编码器的已知向量与「生成矩阵 → 反解回原文」、代理的鉴权/头改写/Upgrade 透传/
+收尾不卡住、宿主半边的**默认关闭与开关持久化**（含「重新 import 模拟重启」和状态文件损坏），
+以及浏览器半边在几种数据状态下的渲染冒烟与「入口独占一行」。
 
 #### 耗时诊断
 
@@ -284,3 +329,16 @@ dist\DeepSeekHarness.exe
 `dsh web` 只监听 loopback，不允许对外提供服务：`--host 0.0.0.0` 被 CLI 直接拒绝，
 `--host <具体IP>` 过不了配置校验。要让其他设备访问只能套反向代理/隧道，
 且真实 authority 必须进 `--trusted-host`，否则 `/api` 会被 browser-trust fence 挡成 403。
+
+内置的 `lan_access` 插件就是照这条路走的：**反向代理**在局域网侧另开一个口子，
+转发时把 `Host` / `Origin` / `Referer` 改写成回环 authority、`Cookie` 换成它自己用
+launch token 换来的 dsh 会话 cookie —— 围栏和鉴权都由代理替浏览器过掉，
+浏览器从头到尾只跟代理打交道。而且这个口子**默认是关的**（要在面板里手动开），
+开关状态落盘，下次启动照旧。原理、代价与踩过的坑见
+[dist/plugins/lan_access/README.md](dist/plugins/lan_access/README.md)。
+
+`sidebar.footer.action` 是 `kind:"list"` 槽位，注册项被摊在 dsh 的 `footerActions` 里，
+而那是 `display:flex` 且**不换行**的行容器 —— 所以多个插件默认会各占一半挤在同一行。
+想让入口独占一行，只能在挂载时把那个容器的 `flex-wrap` 改成 `wrap`（`lan_access` 就是这么做的）。
+坑在于**不能只看 `parentElement`**：`renderSlot()` 会先套一层 `display:contents` 的锚点，
+盒子不参与布局，改它等于没改 —— 要往上找第一个 computed display 是 `flex` 的祖先。
