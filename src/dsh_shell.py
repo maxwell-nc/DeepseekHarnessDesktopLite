@@ -59,6 +59,26 @@ WINDOW_BG = "#f4f6fb"
 # 置空则回退到系统自身的 npm 配置（~/.npmrc）。
 DEFAULT_REGISTRY = "https://registry.npmmirror.com"
 
+# 首次安装未就绪时让用户三选一的镜像列表（label, url）。
+# 顺序即推荐顺序：npmmirror 一般最快，但部分地区连不上时华为云更快。
+REGISTRY_CHOICES = (
+    ("npmmirror（阿里）", "https://registry.npmmirror.com"),
+    ("华为云", "https://repo.huaweicloud.com/repository/npm"),
+    ("腾讯云", "https://mirrors.cloud.tencent.com/npm"),
+)
+
+
+def registry_label(value):
+    """给一个 registry URL 返回短名；空串 = 跟随系统。"""
+    value = (value or "").strip()
+    if not value:
+        return "跟随系统"
+    for label, url in REGISTRY_CHOICES:
+        if value == url:
+            return label
+    return value
+
+
 # dsh web 启动时会打印一个带 token 的地址，必须用这个地址访问，
 # 直接访问 http://127.0.0.1:3080/ 会返回 401。
 TOKEN_URL_RE = re.compile(r"(https?://[\w.\-]+:\d+/\?token=[A-Za-z0-9_\-]+)")
@@ -199,9 +219,77 @@ def report_onefile_extract():
 # 原生 loading（启动期唯一的界面）
 # --------------------------------------------------------------------------- #
 
-# 主窗口里那层原生 loading 的句柄：(panel, tip label)，外加最新状态文字
-_LOADING = {"panels": [], "text": "正在启动本地服务…", "action": None, "armed": False}
+# 主窗口里那层原生 loading 的状态：已铺上的面板、最新状态文字、待回答的镜像询问
+_LOADING = {
+    "panels": [],
+    "text": "正在启动本地服务…",
+    "action": None,
+    "armed": False,
+    "asker": None,
+}
 _LOADING_LOCK = threading.Lock()
+
+# 界面迟迟铺不上（WebView2 初始化失败之类）时，别让首次安装一直等着选镜像
+ASKER_UI_TIMEOUT = 20.0
+
+
+class _LoadingPanel(object):
+    """铺在主窗口里的那一层原生 loading：控件 + 把镜像选择器亮出来的入口。"""
+
+    __slots__ = ("panel", "tip", "ask")
+
+    def __init__(self, panel, tip, ask):
+        self.panel = panel
+        self.tip = tip
+        self.ask = ask      # ask(asker, reveal) —— 只能在 UI 线程调用
+
+
+class _RegistryAsker(object):
+    """一次「用哪个 npm 镜像」的询问，等用户在启动界面上点确认。"""
+
+    def __init__(self, current):
+        self.current = current
+        self.choice = None
+        self.shown = threading.Event()      # 选择器已经铺到界面上
+        self.decided = threading.Event()    # 用户已经点了「开始安装」
+
+
+def ask_registry_choice(current):
+    """首次安装前问一次用哪个镜像，返回选中的 registry URL。
+
+    选择器不另开窗体，直接铺在原生 loading 那一层上（用户看到的还是同一个启动
+    界面），所以也不用自建消息泵。界面迟迟铺不上（WebView2 初始化失败之类）就
+    回退到 current，不把首次安装卡死。
+    """
+    asker = _RegistryAsker(current)
+    with _LOADING_LOCK:
+        _LOADING["asker"] = asker
+        items = list(_LOADING["panels"])
+        action = _LOADING.get("action")
+
+    # 面板已经在（重启流程）就立刻铺上；还没建（首启时本线程跑在 webview.start()
+    # 前面）就留给建面板的那段代码来取，见 patch_webview_loading。
+    for item in items:
+        try:
+            if action is not None and item.panel.InvokeRequired:
+                item.panel.BeginInvoke(action(lambda _item=item: _item.ask(asker, True)))
+            else:
+                item.ask(asker, True)
+        except Exception as exc:  # noqa: BLE001
+            log("铺镜像选择器失败: %s" % exc)
+
+    if not asker.shown.wait(ASKER_UI_TIMEOUT):
+        log("镜像选择器没铺上（原生 loading 不可用？），沿用当前镜像")
+        with _LOADING_LOCK:
+            if _LOADING.get("asker") is asker:
+                _LOADING["asker"] = None
+        return current
+
+    asker.decided.wait()        # 问题已经在界面上了，等用户点，不设超时
+    with _LOADING_LOCK:
+        if _LOADING.get("asker") is asker:
+            _LOADING["asker"] = None
+    return asker.choice or current
 
 
 def set_loading_tip(text):
@@ -212,17 +300,17 @@ def set_loading_tip(text):
         items = list(_LOADING["panels"])
     action = _LOADING.get("action")
 
-    for panel, label in items:
+    for item in items:
 
-        def apply(_label=label, _text=text):
+        def apply(_label=item.tip, _text=text):
             try:
                 _label.Text = _text
             except Exception:  # noqa: BLE001
                 pass
 
         try:
-            if action is not None and panel.InvokeRequired:
-                panel.BeginInvoke(action(apply))
+            if action is not None and item.panel.InvokeRequired:
+                item.panel.BeginInvoke(action(apply))
             else:
                 apply()
         except Exception as exc:  # noqa: BLE001
@@ -244,6 +332,8 @@ def patch_webview_loading():
     启动期唯一的界面就是这一层：应用名 + 进度条 + 一行状态（状态文字由
     ``set_loading_tip`` 从服务线程实时更新）。等 dsh 页面真正加载完
     （``arm_loading_drop()`` 之后再收到 NavigationCompleted）才撤掉，露出真页面。
+    首次安装前问「用哪个 npm 镜像」也用这一层（见 ``ask_registry_choice``）：
+    选项直接铺在这里，不另开窗体。
 
     两个必须记住的坑：
 
@@ -335,9 +425,37 @@ def patch_webview_loading():
             with _LOADING_LOCK:
                 tip.Text = _LOADING["text"]
 
+            # 镜像选择器：常驻控件，平时收着，首次安装前才亮出来（不另开窗体，
+            # 和第 2 条坑一个道理）。放在状态行下面，内容块平时高 132，亮出来时变高。
+            ask_box = WinForms.Panel()
+            ask_box.Size = Size(560, 134)
+            ask_box.Location = Point(0, 132)
+            ask_box.BackColor = color
+            ask_box.Visible = False
+
+            radios = []
+            for i, (label, _url) in enumerate(REGISTRY_CHOICES):
+                radio = WinForms.RadioButton()
+                radio.Text = label
+                radio.AutoSize = True      # 默认是 False，不打开「npmmirror（阿里）」会被截断
+                radio.Location = Point(200, 6 + i * 28)
+                radio.ForeColor = ColorTranslator.FromHtml("#1b2130")
+                radio.BackColor = color
+                radio.Font = make_font(10.5) or radio.Font
+                radios.append(radio)
+                ask_box.Controls.Add(radio)
+
+            go = WinForms.Button()
+            go.Text = "开始安装"
+            go.Size = Size(120, 32)
+            go.Location = Point(220, 96)
+            go.Font = make_font(10.5) or go.Font
+            ask_box.Controls.Add(go)
+
             box.Controls.Add(title)
             box.Controls.Add(bar)
             box.Controls.Add(tip)
+            box.Controls.Add(ask_box)
 
             def recenter(_sender=None, _args=None):
                 try:
@@ -348,6 +466,43 @@ def patch_webview_loading():
                 except Exception:  # noqa: BLE001
                     pass
 
+            def show_asker(asker, reveal=False):
+                """把镜像选择器亮出来（只在 UI 线程调）。"""
+                if reveal:
+                    try:
+                        # 用户可能把窗口收进托盘了：得拉回来，否则他看不到问题
+                        window.show()
+                    except Exception as exc:  # noqa: BLE001
+                        log("拉起主窗口失败: %s" % exc)
+                for radio, (_label, url) in zip(radios, REGISTRY_CHOICES):
+                    radio.Checked = url == asker.current
+                if not any(radio.Checked for radio in radios):
+                    radios[0].Checked = True        # 配置里是「跟随系统」之类，默认第一个
+                go.Enabled = True
+                ask_box.Visible = True
+                box.Size = Size(560, 132 + ask_box.Height)
+                recenter()
+                set_loading_tip("首次运行，请选择下载镜像（约 220 MB）：")
+                asker.shown.set()
+
+            def confirm(_sender=None, _args=None):
+                asker = _LOADING.get("asker")
+                if asker is None:
+                    return
+                go.Enabled = False
+                for radio, (_label, url) in zip(radios, REGISTRY_CHOICES):
+                    if radio.Checked:
+                        asker.choice = url
+                        break
+                # 收起选择器，界面还原成「纯进度」，接下来由安装流程刷进度
+                ask_box.Visible = False
+                box.Size = Size(560, 132)
+                recenter()
+                set_loading_tip("正在准备安装…")
+                asker.decided.set()
+
+            go.Click += confirm
+
             panel.Resize += recenter
             panel.Controls.Add(box)
             form.Controls.Add(panel)
@@ -356,7 +511,12 @@ def patch_webview_loading():
             mark("原生 loading 已铺上（WebView2 在底下并行初始化）")
 
             with _LOADING_LOCK:
-                _LOADING["panels"].append((panel, tip))
+                _LOADING["panels"].append(_LoadingPanel(panel, tip, show_asker))
+                pending = _LOADING.get("asker")
+
+            if pending is not None:
+                # 服务线程比窗口起得早：它要的镜像选择器在这里补上
+                show_asker(pending)
 
             dropped = []
             action = _LOADING["action"]
@@ -364,14 +524,17 @@ def patch_webview_loading():
             def drop(force=False):
                 if dropped:
                     return
-                if not force:
-                    with _LOADING_LOCK:
+                with _LOADING_LOCK:
+                    if not force:
                         if not _LOADING["armed"]:
                             return      # 真实页面还没开始导航，继续等
+                    elif _LOADING.get("asker") is not None:
+                        # 兜底撤离不能撤掉还没人回答的问题：撤了用户就没法选镜像
+                        return
                 dropped.append(1)
                 with _LOADING_LOCK:
                     for item in list(_LOADING["panels"]):
-                        if item[0] is panel:
+                        if item.panel is panel:
                             _LOADING["panels"].remove(item)
 
                 def remove():
@@ -1119,6 +1282,8 @@ class DshService(object):
         self._lock = threading.RLock()
         self._proc = None
         self._log_handle = None
+        # 首次安装的 npm 子进程：安装中途退出时要在 _shutdown 里终止它
+        self._npm_proc = None
         self._service_tail = deque(maxlen=300)
         # dsh web 每次启动都会打印带 token 的地址，直接用裸地址会 401
         self.web_url = None
@@ -1260,6 +1425,9 @@ class DshService(object):
             )
         except OSError as exc:
             return False, "启动 npm 失败：%s" % exc
+        # 记录句柄：用户在安装中途退出时，_shutdown 要能终止这个进程树，
+        # 否则 node/npm 会残留在后台继续下载。
+        self._npm_proc = proc
 
         # npm 在非 TTY 下会把输出攒着，加个心跳让界面别看起来像卡死
         stop_beat = threading.Event()
@@ -1300,6 +1468,9 @@ class DshService(object):
             return False, "npm 执行异常：%s" % exc
         finally:
             stop_beat.set()
+            with self._lock:
+                if self._npm_proc is proc:
+                    self._npm_proc = None
 
         tail = "\n".join(lines[-25:]) if lines else "(npm 无输出)"
         if code != 0:
@@ -1394,6 +1565,15 @@ class DshService(object):
                     log("捕获到带 token 的访问地址")
         except Exception as exc:  # noqa: BLE001
             log("读取服务输出异常: %s" % exc)
+
+    def stop_npm_install(self):
+        """终止还在跑的首次安装 npm 进程树（用户在安装中途退出时调用）。"""
+        with self._lock:
+            proc = self._npm_proc
+            self._npm_proc = None
+        if proc is not None and proc.poll() is None:
+            log("终止进行中的 npm 安装 pid=%s" % proc.pid)
+            _timed("taskkill npm 安装进程树", kill_tree, proc.pid)
 
     def stop(self, wait_release=10.0):
         """停掉服务：先收自己拉起的进程，再兜底清掉占用端口的残留 node。
@@ -1904,10 +2084,17 @@ class DshShellApp(object):
 
             version = _timed("读已安装版本", self.service.installed_version)
             if not version:
+                # 尚未安装：先在启动界面里让用户挑一个镜像，写进配置再装。
+                chosen = ask_registry_choice(effective_registry() or DEFAULT_REGISTRY)
+                cfg = load_config()
+                if chosen and chosen != (cfg.get("registry") or "").strip():
+                    cfg["registry"] = chosen
+                    save_config(cfg)
+                    log("镜像已写入配置：%s" % chosen)
                 self.set_status(
                     "首次运行，正在安装 DeepSeek Harness…",
-                    "npm install %s —— 首次安装需要下载依赖，请耐心等待\nregistry: %s"
-                    % (PACKAGE, effective_registry() or "系统默认"),
+                    "npm install %s —— 首次安装需要下载依赖，请耐心等待\n镜像: %s"
+                    % (PACKAGE, registry_label(effective_registry())),
                 )
                 self.notify("首次运行，正在安装 DeepSeek Harness…")
                 ok, output = self.service.npm_install(PACKAGE, self._npm_progress)
@@ -1954,7 +2141,16 @@ class DshShellApp(object):
             self.set_tail(traceback.format_exc(limit=3))
 
     def _npm_progress(self, line):
-        self.set_tail(line)
+        """npm 的每一行输出：写进日志，同时刷到启动 loading 的提示行上，
+        让首次安装的进度直接显示出来（loading 只有一行，取行尾关键信息）。"""
+        if not line:
+            return
+        log("tail: %s" % line)
+        text = line.strip()
+        # loading 提示行宽度有限：包名/进度条在行尾，砍掉过长的前缀
+        if len(text) > 90:
+            text = "…" + text[-89:]
+        set_loading_tip("安装中：%s" % text)
 
     def load_url(self):
         window = self.window
@@ -2069,25 +2265,21 @@ class DshShellApp(object):
 
     @staticmethod
     def _registry_label(_item=None):
-        registry = effective_registry()
-        if not registry:
-            return "npm 源：跟随系统"
-        if "npmmirror" in registry:
-            return "npm 源：国内镜像"
-        return "npm 源：%s" % registry
+        return "npm 源：%s" % registry_label(effective_registry())
 
     def action_toggle_registry(self, *_args):
+        """托盘菜单点一下就在 镜像1 → 镜像2 → 镜像3 → 跟随系统 → 镜像1 之间轮换。"""
         cfg = load_config()
         current = (cfg.get("registry") or "").strip()
-        if "npmmirror" in current:
-            cfg["registry"] = ""
-            label = "跟随系统 npm 配置"
+        order = [url for _label, url in REGISTRY_CHOICES] + [""]
+        if current in order:
+            nxt = order[(order.index(current) + 1) % len(order)]
         else:
-            cfg["registry"] = DEFAULT_REGISTRY
-            label = "国内镜像（npmmirror）"
+            nxt = order[0]
+        cfg["registry"] = nxt
         save_config(cfg)
         log("npm 源切换为：%s" % (cfg["registry"] or "(系统默认)"))
-        self.notify("npm 源已切换：%s" % label)
+        self.notify("npm 源已切换：%s" % registry_label(nxt))
 
     def build_menu(self):
         return pystray.Menu(
@@ -2147,7 +2339,12 @@ class DshShellApp(object):
         threading.Thread(target=self._shutdown, daemon=True).start()
 
     def _shutdown(self):
-        """退出收尾：停服务 -> 销毁窗口 -> 强杀进程。"""
+        """退出收尾：停安装/服务 -> 销毁窗口 -> 强杀进程。"""
+        try:
+            # 首次安装还在跑的话，先把 npm 进程树杀掉，别留 node 在后台下载
+            self.service.stop_npm_install()
+        except Exception as exc:  # noqa: BLE001
+            log("退出时终止 npm 安装失败: %s" % exc)
         try:
             self.service.stop()
         except Exception as exc:  # noqa: BLE001
