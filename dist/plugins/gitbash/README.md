@@ -1,7 +1,9 @@
 # dist/plugins/gitbash — 让 dsh 在 Windows 上只用 Git Bash（纯插件版）
 
 把 DeepSeek Harness（`@deepseek-ai/dsh`）的 shell 执行器换成 Git Bash，
-**并让模型看到的 shell 工具就叫 `bash`**。
+**并让模型看到的 shell 工具就叫 `bash`**。标准模式和极简模式都覆盖：
+极简模式（minimal 预设）不走 `ctx.shell`，挂的是持久 PTY 终端栈，本插件
+把那套 PTY 的 shell 也换成 Git Bash（v2.1.0 起，见下文「极简模式」一节）。
 
 这个目录是 **dsh-ui 的插件包**：exe 同目录的 `plugins/` 下每个子目录是一个插件，
 dsh-ui 启动时会把「已启用」的插件镜像到 dsh 自己的插件目录并刷新 profile 补丁。
@@ -74,6 +76,76 @@ Windows 上改成 bash 有三层原因（都是实测，不是推测）：
 文件访问限制。**文件工具那条路径不受影响** —— `dsh-fs-sandbox` 是独立体系。
 工具描述里已经把这一点如实告诉了模型。
 
+## 极简模式（v2.1.0 修掉的劈叉）
+
+极简模式（minimal 预设）是另一套 shell 栈，**不走 `ctx.shell`**：
+
+```
+dsh-terminal（PTY 注册表）
+└── dsh-terminal-bash      win32 上 shellDialect: pwsh → 起的是 PowerShell
+└── dsh-tool-pwsh-persistent  注册的工具名恰好也叫 `pwsh`
+```
+
+v2.0.0 只做了「换执行器 + 按名字改写 `pwsh` 工具」，于是极简模式下出现：
+提示词被改成 Git Bash（名字撞上了），执行路径却还是 PowerShell 的 PTY ——
+模型按 POSIX 语法写命令，实际进的是 PowerShell。这就是「提示词是 gitbash、
+实际是 powershell」的来历。
+
+v2.1.0 补了第三条平面：
+
+- **拦 `TerminalSessionService.prototype.registerBackend`**（原型补丁，覆盖每个
+  agent 入局隔离的 terminals 实例）：pwsh 方言的 `shell` 后端被**就地换成**
+  Git Bash 的 bash 方言 —— `shellPath`/`shellArgs` 换掉，`shellDialect` 也一起换，
+  因为 dialect 决定启动协议（bash 用 `PS1` + `PROMPT_COMMAND` 打就绪标记，
+  pwsh 是注入 prompt 函数；只换 shell 不换协议，PTY 就绪检测会崩）。
+- **绕过 PTY 的沙箱 confine**：`spawnArgv` 在非 danger 模式下会把 PTY argv 交给
+  ACL runner，MSYS2 起不来（第 3 条）。给后端的 ctx 套了个只拦 `get("sandbox")`
+  的代理，返回「confine 原样返回」的替身，其余调用全部转发真 ctx。
+- **持久工具的提示词单独一份**：状态跨调用保留、没有作业 API、超时/打断会整壳
+  重置 —— 和一次性版的「每次新进程」描述区分开。两个工具都叫 `pwsh`，按参数
+  形状区分（持久版整个 schema 只有 `command`）。
+- **Git Bash 没探测到时不改持久终端**：PTY 换过去只会起不来，不如保留能用的
+  PowerShell（工具名也就不撒谎，维持 `pwsh` + PowerShell 描述）。
+
+v2.2.0 又补了一层（这是 2.1.0 没修干净的部分）：**工具层也要换方言**。
+`dsh-tool-pwsh-persistent` 不只是名字带 pwsh —— 它的 execute 整个说的是 PowerShell：
+建壳时往 PTY 里发 `function prompt {...}` 的 PS 片段，每条用户命令都包进
+`Write-Output '开始标记'; Invoke-Expression "..."; Write-Output ('结束标记:' + $LASTEXITCODE)`
+的 PS 包装。PTY 换成 Git Bash 后，bash 收到这些等于收到乱码：标记永远打不出来，
+工具的标记轮询一直转到 300 秒命令超时 —— 实测就是「每条 bash 都要等很久」，
+打断时报 `Error: [object Object]`（abort reason 不是 Error，被 stringify 了）。
+
+所以注册拦截对持久工具做**整体替换**：保留 output schema / presentCall，
+`execute` 换成本插件的 bash 方言实现（`createBashPersistentExecute`）：
+
+- 壳缓存按 owner（agent）挂 WeakMap，首次调用 spawn、之后复用（实测同一 shell
+  pid、cd 和环境变量跨调用保留）；
+- 每条命令包成**单物理行**：`printf '开始标记'; eval "$(printf %s '<base64>' | base64 -d)"; 退出码变量=$?; printf '结束标记:退出码'`
+  —— base64 避开引号/换行/续行提示符对输出区的污染，START/END 标记把命令输出
+  从 tty 回显和 prompt 里干净地切出来，退出码随 END 标记回来；
+- 超时（300s，与上游 minimal 预设一致）回部分输出并整壳重置；被打断按上游语义
+  原样上抛 abort reason；session 退出渲染退出状态并重置；
+- 终端服务从 `exec.agent.ctx` 现取 —— 那是本 agent 入局隔离的 terminals 注册表，
+  PTY 后端已被上面的平面换成 Git Bash。
+
+v2.2.1 修掉 2.2.0 的一个真 bug：**极简模式下持久工具拿不到 terminals**。
+2.2.0 的 `createBashPersistentExecute` 从 `exec.agent.ctx` 现取 terminals —— 但
+minimal 预设把 `persistent-shell` 组声明成 `isolate: { terminals: true }`，terminals
+是**组内**的服务，agent 自己的 scope ctx（组外）向上查不到它，于是每次调用都抛
+`persistent bash tool cannot reach the terminals service of this agent` —— 这就是
+「极简模式 Git Bash 还是不可用」的根因。
+
+v2.2.2 修掉 2.2.1 的修法：2.2.1 假设 cordis 的 tracker 会把注册拦截里的 `this.ctx`
+重绑成 persistent-shell 组的 ctx（看得见 terminals），**实测拿不到** —— 工具改写
+确实触发了（模型看到的是 bash + 持久描述），但 `terminalsOf` 对注册时捕获的 ctx
+和 `exec.agent.ctx` 都取不到 terminals，照样抛错。真正可靠的是 dsh 文档化的生产
+路径 `serviceForAgent(ctx, agent, name)`（`@deepseek-ai/dsh-agent-presets`）：它从
+reflect 的**原始 store** 按 fiber 归属取 agent 挂载的隔离服务，不经过 isolate
+realm 的可见性过滤 —— api-proxy 的每个浏览器 RPC（session controller 读
+`serviceFor(live, "skills")` 等）都走这条路径。`terminalsOf` 现在优先
+`serviceForAgent(registrationCtx, owner, 'terminals')`，拿不到再退回注册时捕获的
+ctx 与 `exec.agent.ctx`（标准模式等非隔离场景仍直接可见）。
+
 ## 跨机器 / 跨项目的细节
 
 - **插件里没有绝对路径。** 插件需要 `@deepseek-ai/dsh-bash-local` 这类包才能
@@ -109,5 +181,7 @@ Windows 上改成 bash 有三层原因（都是实测，不是推测）：
 ```
 [dsh-bash-gitbash] bash = C:\Program Files\Git\bin\bash.exe（无沙箱执行器）
 [dsh-bash-gitbash] 工具改写已装：pwsh -> bash
+[dsh-bash-gitbash] 持久终端改写已装：pwsh PTY -> Git Bash PTY
 [dsh-bash-gitbash] 正在注册的工具 pwsh 已改写为 bash      # 每个会话/预设挂载打一次
+[dsh-bash-gitbash] 持久终端后端（…pwsh.exe）已换成 Git Bash  # 极简模式挂载持久终端时
 ```
