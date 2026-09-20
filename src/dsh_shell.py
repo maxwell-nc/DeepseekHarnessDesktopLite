@@ -45,7 +45,7 @@ from app_icon import make_icon, save_ico
 # --------------------------------------------------------------------------- #
 
 APP_NAME = "DeepSeek Harness"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 PACKAGE = "@deepseek-ai/dsh"
 HOST = "127.0.0.1"
 PORT = 3080
