@@ -2589,6 +2589,8 @@ class TaskbarJobWatcher(object):
         self._thread = None
         self._has_live = False
         self._last_title = None
+        # 每个会话的 running 状态（sessionId -> bool），全局 live = 任一为 True
+        self._running_sessions = {}
 
     # ---------------- 对外接口 ---------------- #
 
@@ -2675,6 +2677,7 @@ class TaskbarJobWatcher(object):
                 pass
             # 断线期间没有状态可依，回到空闲（重连后会重新拉快照）
             self._has_live = False
+            self._running_sessions = {}
 
     def _fetch_running(self, cookie):
         """调 session/list 拿所有会话的 running 快照。"""
@@ -2694,8 +2697,12 @@ class TaskbarJobWatcher(object):
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode("utf-8"))
         items = ((data.get("result") or {}).get("value") or {}).get("items") or []
-        live = any(item.get("running") for item in items)
-        self._update_live(live)
+        # 重建整个 running 集合（快照是权威的）
+        self._running_sessions = {
+            item.get("sessionId"): bool(item.get("running"))
+            for item in items
+        }
+        self._update_live(any(self._running_sessions.values()))
 
     def _handle_message(self, msg):
         """处理一帧 WS 消息。返回 False 表示流已结束，需要重连。"""
@@ -2719,8 +2726,10 @@ class TaskbarJobWatcher(object):
             event = value.get("event")
             args = value.get("args") or []
             if event == "api-session/status" and len(args) >= 2:
-                # args = [sessionId, running]
-                self._update_live(bool(args[1]))
+                # args = [sessionId, running] —— 只更新这一个会话，
+                # 全局 live 仍看所有会话（任一 running 就播动画）
+                self._running_sessions[args[0]] = bool(args[1])
+                self._update_live(any(self._running_sessions.values()))
         return True
 
     def _update_live(self, live):
