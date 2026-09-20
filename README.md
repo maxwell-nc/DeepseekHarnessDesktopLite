@@ -139,14 +139,14 @@ dist/
 │   │   ├── lib/qr.mjs               # 纯 JS 二维码编码器 → SVG
 │   │   ├── lib/client.js            # 浏览器半边：侧边栏入口（独占一行）+ 二维码/开关面板
 │   │   └── README.md
-│   └── retry/                       # 内置插件：消息编辑 / 重试
-│       ├── manifest.json
-│       ├── cordis.patch.yml         # 只插 host 半边
-│       ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
-│       ├── retry.mjs                # host 半边：算「切哪儿、原文是什么」的读取接口
-│       ├── lib/origin.mjs           # 纯函数：会话日志 → 切点 + 原文
-│       ├── lib/client.js            # 浏览器半边：消息上的编辑/重试按钮 + 分支重发
-│       └── README.md
+│   ├── retry/                       # 内置插件：消息编辑 / 重试
+│   │   ├── manifest.json
+│   │   ├── cordis.patch.yml         # 只插 host 半边
+│   │   ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
+│   │   ├── retry.mjs                # host 半边：算「切哪儿、原文是什么」的读取接口
+│   │   ├── lib/origin.mjs           # 纯函数：会话日志 → 切点 + 原文
+│   │   ├── lib/client.js            # 浏览器半边：消息上的编辑/重试按钮 + 分支重发
+│   │   └── README.md
 ```
 
 **装进 dsh 的规则**（dsh-ui 每次启动、以及管理器点「重启」时执行）：
@@ -252,6 +252,23 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
   `POST .../commit` 真正建分支 + 发消息；浏览器半边只负责刷列表和把界面切过去。
   **改完这个插件要重启服务**（`patchReload: live` 对插件文件不生效，重启最稳）。
 - 详细取舍、DOM 契约和自测见 [dist/plugins/retry/README.md](dist/plugins/retry/README.md)。
+
+### 任务栏鲸鱼动画（桌面壳内置）
+
+**有会话在活动（agent 正在响应）时，任务栏按钮的文字变成鲸鱼游动 + 波浪起伏的动画**：
+鲸鱼 `🐋` 匀速左右游动，三层波浪（`≈` 内层、`~` 中层、`-` 外层）从鲸鱼两侧一层层
+泛起又收回；空闲时回到静止的「DeepSeek Harness」。
+
+- **「在跑」的判据 = 前端会话列表的活动指示器**：`session/list` 的 summaries 里
+  任一会话 `running` 为 true（agent 正在响应），或 `$events` 事件流收到
+  `api-session/status` 事件。和侧边栏会话名字旁那个旋转动画同源。
+- **每帧固定 12 字符**（「DeepSeek Harness」左右各删 2 个字符，按字符数计、
+  非字体测量），任务栏按钮不会随动画变宽变窄。
+- **桌面壳 Python 侧实现**（`src/dsh_shell.py` 的 `TaskbarJobWatcher`）：WebSocket
+  直连本地服务订阅 `$events` 事件流，与 WebView2 页面无关 —— 窗口最小化、隐藏到
+  托盘、甚至页面卡住时都照常工作。
+- **低占用**：约 5.5 帧/秒（0.18s/帧），50ms 接收超时 + 50ms 等待，不空转；
+  标题只在变化时写入。
 
 ## 两个容易踩的坑
 

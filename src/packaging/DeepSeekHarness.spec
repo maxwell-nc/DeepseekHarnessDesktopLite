@@ -37,6 +37,15 @@ hiddenimports = [
     "pystray._win32",
     "clr",
     "clr_loader",
+    "websocket",
+    "websocket._abnf",
+    "websocket._handshake",
+    "websocket._http",
+    "websocket._socket",
+    "websocket._url",
+    "websocket._utils",
+    "websocket._core",
+    "websocket._app",
 ]
 
 # 明确用不到的东西，剔掉能省不少体积

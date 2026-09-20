@@ -11,8 +11,10 @@ DeepSeek Harness 桌面壳
 * 托盘菜单一键**更新**：停止服务 -> ``npm install @deepseek-ai/dsh@latest`` -> 重启服务
 """
 
+import http.cookiejar
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -24,6 +26,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 from collections import deque
 
@@ -36,6 +39,7 @@ if not hasattr(sys, "_MEIPASS"):        # frozen 时不折腾，bundle 里没这
 
 import pystray
 import webview
+import websocket
 from PIL import Image
 
 from app_icon import make_icon, save_ico
@@ -1964,6 +1968,8 @@ class DshShellApp(object):
         self.icon = None
         self.quitting = False
         self.busy = threading.Lock()
+        # 任务栏任务动画监听（订阅 dsh 任务状态，有任务时刷标题动画）
+        self.taskbar_watcher = None
         # 插件管理器窗口底部那行状态文字
         self.plugin_status = ""
         self.plugin_error = False
@@ -2426,6 +2432,13 @@ class DshShellApp(object):
         self.quitting = True
         log("退出：先把界面撤掉，再清理后台")
 
+        # 停掉任务栏任务动画监听，标题恢复空闲文字
+        if self.taskbar_watcher is not None:
+            try:
+                self.taskbar_watcher.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
         # 退出前把主窗口几何记下来（重启应用/退出都走这里）
         self._capture_geometry()
         self._save_geometry()
@@ -2543,6 +2556,263 @@ def acquire_single_instance():
 
 
 # --------------------------------------------------------------------------- #
+# 任务栏任务动画
+# --------------------------------------------------------------------------- #
+
+
+class TaskbarJobWatcher(object):
+    """监听 dsh 会话活动状态，判断 dsh 自身是否有对话/任务在跑。
+
+    有会话处于 running（agent 正在响应）时，把主窗口标题（= 任务栏按钮
+    文字）刷成鲸鱼游动 + 波浪扩张的文字动画，空闲时恢复 "DeepSeek Harness"。
+
+    * 数据源和前端会话列表的活动指示器完全一致：
+      - 初始状态：session/list 的 summaries（running 字段）
+      - 实时更新：$events 事件流的 api-session/status 事件
+    * 走 WebSocket 直连本地服务，与 WebView2 页面无关 —— 窗口最小化、
+      隐藏到托盘、甚至页面卡住时都照常工作。
+    * 动画每帧严格 16 字符（和 "DeepSeek Harness" 等长，按字符数计，
+      非字体测量）。
+    """
+
+    MUX_PATH = "/api/remote.mux"
+    EVENTS_ENDPOINT = "$events"
+    LIST_ENDPOINT = "session/list"
+    FRAME_INTERVAL = 0.18          # 动画帧间隔（秒）
+    RECONNECT_DELAY = 3.0          # 断线重连间隔（秒）
+    IDLE_TEXT = APP_NAME           # 空闲时任务栏文字（16 字符）
+    ANIM_WIDTH = len(IDLE_TEXT) - 4  # 动画宽度：左右各删 2 个字符（12 字符）
+
+    def __init__(self, app):
+        self._app = app
+        self._stop = threading.Event()
+        self._thread = None
+        self._has_live = False
+        self._last_title = None
+
+    # ---------------- 对外接口 ---------------- #
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="taskbar-watcher"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    # ---------------- 主循环 ---------------- #
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._connect_once()
+            except Exception as exc:  # noqa: BLE001
+                log("任务栏任务监听异常: %s" % exc)
+            if self._stop.wait(self.RECONNECT_DELAY):
+                break
+        self._set_title(self.IDLE_TEXT)
+
+    def _connect_once(self):
+        """连一次 WebSocket 并订阅 $events 事件流，直到断线或停止。"""
+        url = self._app.service.access_url
+        match = TOKEN_RE.search(url or "")
+        if not match:
+            return
+        cookie = self._exchange_cookie(match.group(1))
+        if not cookie:
+            return
+        # 初始状态：先拉一次 session/list 拿 running 快照
+        try:
+            self._fetch_running(cookie)
+        except Exception as exc:  # noqa: BLE001
+            log("任务栏任务监听: 初始状态获取失败 %s" % exc)
+        ws = websocket.create_connection(
+            "ws://%s:%d%s" % (HOST, PORT, self.MUX_PATH),
+            header=["Cookie: " + cookie],
+            timeout=10,
+        )
+        try:
+            sid = str(uuid.uuid4())
+            ws.send(json.dumps({
+                "type": "open",
+                "streamId": sid,
+                "endpoint": self.EVENTS_ENDPOINT,
+                "payload": {"args": {}},
+            }))
+            ws.settimeout(0.05)
+            next_frame_at = 0.0
+            tick = 0
+            while not self._stop.is_set():
+                # 1) 尽量把已到的消息读完（最多等 50ms）
+                try:
+                    msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    msg = None
+                except websocket.WebSocketConnectionClosedException:
+                    break
+                if msg:
+                    if not self._handle_message(msg):
+                        return  # 流已结束/出错，重连
+                # 2) 按节奏刷标题
+                now = time.monotonic()
+                if self._has_live:
+                    if now >= next_frame_at:
+                        self._set_title(self._frame(tick))
+                        tick += 1
+                        next_frame_at = now + self.FRAME_INTERVAL
+                elif self._last_title != self.IDLE_TEXT:
+                    self._set_title(self.IDLE_TEXT)
+                # 3) 歇一下，别空转
+                self._stop.wait(0.05)
+        finally:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            # 断线期间没有状态可依，回到空闲（重连后会重新拉快照）
+            self._has_live = False
+
+    def _fetch_running(self, cookie):
+        """调 session/list 拿所有会话的 running 快照。"""
+        rpc_id = str(uuid.uuid4())
+        body = json.dumps({
+            "type": "client-request",
+            "rpcId": rpc_id,
+            "method": self.LIST_ENDPOINT,
+            "payload": {"args": {"_request": {}}},
+        })
+        req = urllib.request.Request(
+            "http://%s:%d/api/%s" % (HOST, PORT, self.LIST_ENDPOINT),
+            data=body.encode("utf-8"),
+            headers={"content-type": "application/json", "Cookie": cookie},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        items = ((data.get("result") or {}).get("value") or {}).get("items") or []
+        live = any(item.get("running") for item in items)
+        self._update_live(live)
+
+    def _handle_message(self, msg):
+        """处理一帧 WS 消息。返回 False 表示流已结束，需要重连。"""
+        try:
+            data = json.loads(msg)
+        except ValueError:
+            return True
+        mtype = data.get("type")
+        if mtype == "end":
+            return False
+        if mtype == "error":
+            log("任务栏任务监听: 流错误 %s" % (data.get("error") or {}).get("message"))
+            return False
+        if mtype != "item":
+            return True
+        value = data.get("value") or {}
+        ftype = value.get("type")
+        if ftype == "ready":
+            return True
+        if ftype == "emit":
+            event = value.get("event")
+            args = value.get("args") or []
+            if event == "api-session/status" and len(args) >= 2:
+                # args = [sessionId, running]
+                self._update_live(bool(args[1]))
+        return True
+
+    def _update_live(self, live):
+        if live != self._has_live:
+            self._has_live = live
+            log("任务栏任务状态: %s" % ("有会话活动" if live else "空闲"))
+
+    # ---------------- 动画 ---------------- #
+
+    @staticmethod
+    def _frame(tick):
+        """生成一帧动画：鲸鱼匀速左右游动，三层波浪一层层泛起又收回。
+
+        每帧严格 12 字符（"DeepSeek Harness" 左右各删 2 个字符）。
+        鲸鱼用三角波匀速往返，不会在端点停留。
+        三层波浪（内层 ≈、中层 ~、外层 -）各自呼吸：从鲸鱼两侧
+        泛起、扩散到最大、再收回，三层相位依次错开，形成一层层
+        起伏的涟漪效果。
+        """
+        width = TaskbarJobWatcher.ANIM_WIDTH
+        center = (width - 1) / 2.0
+        amp = width / 2.0 - 2.0
+        # 三角波：0..1 循环，线性往返 -1..1，鲸鱼匀速移动
+        t = (tick % 8.0) / 8.0
+        if t < 0.5:
+            tri = 4.0 * t - 1.0
+        else:
+            tri = 3.0 - 4.0 * t
+        pos = int(round(center + amp * tri))
+        pos = max(1, min(width - 2, pos))
+        chars = ["~"] * width
+        chars[pos] = "🐋"          # 🐋
+        # 三层波浪：内层 ≈、中层 ~、外层 -，从鲸鱼两侧一层层泛起又收回
+        # 三层共用同一个呼吸周期（16 帧：0→最大→0），相位依次错开 2 帧，
+        # 形成"一层推一层"的涟漪效果
+        layers = (
+            (1, 3, "≈", 0),   # ≈ 内层先起，扩到 3 格
+            (2, 4, "~", 2),        # ~ 中层随后，扩到 4 格
+            (3, 5, "-", 4),        # - 外层最后，扩到 5 格
+        )
+        for lo, hi, ch, offset in layers:
+            ph = ((tick + offset) % 16.0) / 16.0
+            if ph < 0.5:
+                r = 2.0 * ph * hi
+            else:
+                r = 2.0 * (1.0 - ph) * hi
+            for dist in range(lo, min(hi, int(r)) + 1):
+                if pos - dist >= 0:
+                    chars[pos - dist] = ch
+                if pos + dist < width:
+                    chars[pos + dist] = ch
+        return "".join(chars)
+
+    # ---------------- 标题写入 ---------------- #
+
+    def _set_title(self, text):
+        if text == self._last_title:
+            return
+        window = self._app.window
+        if window is None:
+            return
+        gui = getattr(window, "gui", None)
+        if gui is None:
+            return
+        try:
+            gui.set_title(text, window.uid)
+        except Exception:  # noqa: BLE001
+            return
+        self._last_title = text
+
+    # ---------------- 认证 ---------------- #
+
+    @staticmethod
+    def _exchange_cookie(token):
+        """用启动 token 换认证 cookie（等价于浏览器首次访问 ?token=...）。"""
+        try:
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cj)
+            )
+            opener.open(
+                urllib.request.Request(
+                    "http://%s:%d/?token=%s" % (HOST, PORT, token), method="GET"
+                ),
+                timeout=5,
+            )
+            return "; ".join("%s=%s" % (c.name, c.value) for c in cj)
+        except Exception:  # noqa: BLE001
+            return None
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 
@@ -2635,6 +2905,15 @@ def main():
     mark("托盘已起")
     app.start_service_async()
     mark("服务启动已派发（后台线程）")
+
+    # 任务栏任务动画：订阅 dsh 任务状态，有任务时把标题刷成鲸鱼动画。
+    # 独立于 WebView2 页面，窗口最小化/隐藏到托盘时照常工作。
+    try:
+        app.taskbar_watcher = TaskbarJobWatcher(app)
+        app.taskbar_watcher.start()
+        mark("任务栏任务监听已启动")
+    except Exception as exc:  # noqa: BLE001
+        log("任务栏任务监听启动失败: %s" % exc)
 
     try:
         webview.start(
