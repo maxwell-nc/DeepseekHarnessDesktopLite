@@ -51,6 +51,8 @@ HOST = "127.0.0.1"
 PORT = 3080
 URL = "http://%s:%d" % (HOST, PORT)
 MUTEX_NAME = "Local\\DeepSeekHarnessDesktopShell"
+# 重启应用时，新实例在单实例锁上轮询等待旧实例退出释放锁的最长时间。
+RESTART_LOCK_TIMEOUT = 30.0
 
 # 窗口底色：亮色主题，和 HTML 里的 --bg 保持一致（WebView2 首帧还没渲染时的底色）
 WINDOW_BG = "#f4f6fb"
@@ -2169,23 +2171,38 @@ class DshShellApp(object):
 
     # ---------------- 托盘动作 ---------------- #
 
-    def action_restart(self, *_args):
+    def action_restart_app(self, *_args):
+        """托盘「重启应用」：先拉起一个新实例，再退出当前实例。
+
+        新实例带着 DSH_UI_RESTART=1 启动，会在单实例锁上轮询等待本实例退出
+        （见 acquire_single_instance），所以这里先 spawn 再 quit 的顺序是安全的：
+        新实例不会因为锁被占而直接退出。旧实例退出时 _shutdown() 会停掉 dsh 服务，
+        新实例随后按正常启动流程把服务拉起来。
+        """
         if not self.busy.acquire(blocking=False):
             self.notify("已有任务在执行，请稍候")
             return
         try:
-            self.set_status("正在重启服务…", "stop -> start")
-            self.service.stop()
-            self.service.start()
-            if not self.service.wait_ready(poll_log=self.set_tail):
-                self.set_status("重启后服务未就绪", self.service.read_service_tail(), "err")
-                self.notify("服务重启失败，请查看日志")
-                return
-            self.set_status("服务已重启", "dsh %s" % (self.service.installed_version() or "?"), "done")
-            self.load_url()
-            self.notify("本地服务已重启")
+            if getattr(sys, "frozen", False):
+                exe = sys.executable
+                cmd = [exe]
+            else:
+                exe = os.path.abspath(sys.argv[0])
+                cmd = [sys.executable, exe]
+            if not os.path.isfile(exe):
+                raise RuntimeError("找不到可执行文件：%s" % exe)
+            env = os.environ.copy()
+            env["DSH_UI_RESTART"] = "1"
+            log("重启应用：拉起新实例 %s" % " ".join(cmd))
+            subprocess.Popen(
+                cmd,
+                cwd=os.path.dirname(exe) or None,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.quit()
         except Exception as exc:  # noqa: BLE001
-            log("重启异常: %s\n%s" % (exc, traceback.format_exc()))
+            log("重启应用异常: %s\n%s" % (exc, traceback.format_exc()))
             self.set_status("重启失败", str(exc), "err")
             self.notify("重启失败：%s" % exc)
         finally:
@@ -2288,7 +2305,7 @@ class DshShellApp(object):
             pystray.MenuItem("在浏览器中打开", self.open_in_browser),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._version_label, None, enabled=False),
-            pystray.MenuItem("重启服务", self.action_restart),
+            pystray.MenuItem("重启应用", self.action_restart_app),
             pystray.MenuItem(self._update_label, self.action_update),
             pystray.MenuItem(self._registry_label, self.action_toggle_registry),
             pystray.Menu.SEPARATOR,
@@ -2402,16 +2419,29 @@ class PluginManagerApi(object):
 
 
 def acquire_single_instance():
+    """拿单实例锁。返回 (ok, handle)。
+
+    重启应用（托盘「重启应用」）时，新实例会带着 DSH_UI_RESTART=1 先起来，
+    旧实例随后退出并释放锁 —— 所以这种启动要**轮询等待**锁，而不是立刻放弃；
+    等不到就放弃，避免两个实例同时跑。
+    """
     try:
         import ctypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        if not handle:
-            return True, None
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-            return False, handle
-        return True, handle
+        restarting = (os.environ.get("DSH_UI_RESTART") or "").strip() == "1"
+        deadline = time.time() + (RESTART_LOCK_TIMEOUT if restarting else 0.0)
+        while True:
+            handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+            if not handle:
+                return True, None
+            if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+                return True, handle
+            if handle:
+                kernel32.CloseHandle(handle)
+            if not restarting or time.time() >= deadline:
+                return False, None
+            time.sleep(0.2)
     except Exception:  # noqa: BLE001
         return True, None
 
