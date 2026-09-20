@@ -189,6 +189,8 @@ function fakeHost(options = {}) {
     live = null,
     withQuery = true,
     cwd = 'D:/work',
+    agentPreset,
+    projectionPreset,
     workspaces = [],
     createFails = false,
     forkFails = false,
@@ -200,7 +202,10 @@ function fakeHost(options = {}) {
         observeSession: async (sessionId) => {
           seen.observed.push(sessionId)
           return {
-            header: { id: sessionId, cwd },
+            header: { id: sessionId, cwd, ...(agentPreset !== undefined ? { agentPreset } : {}) },
+            ...(projectionPreset !== undefined
+              ? { projections: { values: { agentPreset: projectionPreset } } }
+              : {}),
             events,
             [Symbol.dispose]() {
               seen.disposed += 1
@@ -424,6 +429,52 @@ const log3 = [...turnLog(1, '第一句', 0), ...turnLog(2, '第二句', 10), ...
   hostModule.apply(other.ctx)
   await routeOf(other.seen, COMMIT_PATH).fetch(commitRequest({ sessionId: 's1', turn: 1, text: '第一句' }))
   check('B4 会话不属于任何工作区 → 按 cwd 新建', JSON.stringify(other.seen.create[0]) === JSON.stringify({ cwd: 'D:/elsewhere' }), JSON.stringify(other.seen.create[0]))
+}
+
+{
+  // 源会话是极简模式（agentPreset: minimal）→ 第一轮新建会话必须把预设带过去，
+  // 否则重试第一轮会落到默认预设（「重试/编辑后模式变了」的根因）。
+  const { ctx, seen } = fakeHost({ events: log3, agentPreset: 'minimal', workspaces: [{ id: 'ws-9', sessionIds: ['s1'] }] })
+  hostModule.apply(ctx)
+  const payload = await (await routeOf(seen, COMMIT_PATH).fetch(commitRequest({ sessionId: 's1', turn: 1, text: '第一句' }))).json()
+  check('B4 带预设的第一轮 ok', payload.ok === true && payload.kind === 'create', JSON.stringify(payload))
+  check(
+    'B4 create 带上源会话的 agentPreset',
+    JSON.stringify(seen.create[0]) === JSON.stringify({ workspaceId: 'ws-9', agentPreset: 'minimal' }),
+    JSON.stringify(seen.create[0])
+  )
+
+  // 源会话没有 agentPreset（老会话 / 非预设部署）→ create 不带这个字段
+  const plain = fakeHost({ events: log3, workspaces: [{ id: 'ws-9', sessionIds: ['s1'] }] })
+  hostModule.apply(plain.ctx)
+  await routeOf(plain.seen, COMMIT_PATH).fetch(commitRequest({ sessionId: 's1', turn: 1, text: '第一句' }))
+  check('B4 没有 agentPreset 就不带这个字段', JSON.stringify(plain.seen.create[0]) === JSON.stringify({ workspaceId: 'ws-9' }), JSON.stringify(plain.seen.create[0]))
+
+  // 会话创建后切过预设：header 记的是创建时的（standard），投影才是当前的（minimal）。
+  // 这是「极简模式里重试第一轮」的真实形态 —— 必须带投影里的当前预设，否则又变回默认。
+  const switched = fakeHost({
+    events: log3,
+    agentPreset: 'standard',
+    projectionPreset: 'minimal',
+    workspaces: [{ id: 'ws-9', sessionIds: ['s1'] }]
+  })
+  hostModule.apply(switched.ctx)
+  await routeOf(switched.seen, COMMIT_PATH).fetch(commitRequest({ sessionId: 's1', turn: 1, text: '第一句' }))
+  check(
+    'B4 创建后切过预设 → 带投影里的当前预设（不是 header 里的旧值）',
+    JSON.stringify(switched.seen.create[0]) === JSON.stringify({ workspaceId: 'ws-9', agentPreset: 'minimal' }),
+    JSON.stringify(switched.seen.create[0])
+  )
+
+  // 投影没有（老会话 / 非预设部署）→ 退回 header 里的创建时预设
+  const headerOnly = fakeHost({ events: log3, agentPreset: 'minimal', workspaces: [{ id: 'ws-9', sessionIds: ['s1'] }] })
+  hostModule.apply(headerOnly.ctx)
+  await routeOf(headerOnly.seen, COMMIT_PATH).fetch(commitRequest({ sessionId: 's1', turn: 1, text: '第一句' }))
+  check(
+    'B4 没有投影 → 退回 header 里的预设',
+    JSON.stringify(headerOnly.seen.create[0]) === JSON.stringify({ workspaceId: 'ws-9', agentPreset: 'minimal' }),
+    JSON.stringify(headerOnly.seen.create[0])
+  )
 }
 
 /* -------------------------------------------------------------------------- */

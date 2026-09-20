@@ -90,6 +90,13 @@ seed     = events.slice(0, cut)
 - **`create` 的 `workspaceId` 和 `cwd` 不能同时给**，宿主会直接
   `gateway/bad-request: session.create accepts workspaceId or cwd, not both`。
   有工作区就给 `workspaceId`，没有（别的部署）才退回会话自己的 cwd。
+- **第一轮新建会话必须带上源会话的 agent 预设**，否则极简模式里重试第一轮会落到默认
+  预设（「重试/编辑后模式变了」的根因）。预设取**当前值**而不是创建时的值：会话 header
+  里记的是**创建那一刻**的预设，之后用户可能通过 `agent-preset/selected` 切过（极简
+  模式就是这么进的），header 会过期。所以优先读观测的**投影**
+  （`projections.values.agentPreset`，和宿主 fork 路由的 `presetForObservation` 看的是
+  同一份数据），投影拿不到（老会话 / 非预设部署）才退回 header。fork 那条路由宿主自己
+  继承预设，不用管。
 - **fork 出来的子会话会「复活」这一轮那条旧消息**（用户报的「重发之后原来那条还在」）。
   原因：fork 的切点在「上一轮的 `turn/end`」和「这一轮的 `turn/start`」之间，而这一轮
   那条用户消息的 **inbox splice（插入）正好落在这个区间里**，配对的「移除」splice 在

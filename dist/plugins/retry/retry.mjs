@@ -132,7 +132,7 @@ function dispose(resource) {
  *
  * @param ctx - 宿主侧 context。
  * @param sessionId - 会话 id。
- * @returns `{events, header}`（events 按 seq 升序）。
+ * @returns `{events, header, projections}`（events 按 seq 升序）。
  * @throws 当两条路都拿不到日志时。
  */
 async function readLog(ctx, sessionId) {
@@ -147,7 +147,7 @@ async function readLog(ctx, sessionId) {
     try {
       const events = observed?.events
       if (Array.isArray(events) && events.length > 0) {
-        return { events, header: observed?.header ?? undefined }
+        return { events, header: observed?.header ?? undefined, projections: observed?.projections ?? undefined }
       }
     } finally {
       dispose(observed)
@@ -365,7 +365,7 @@ async function handleCommit(ctx, request) {
   }
 
   try {
-    const { events, header } = await readLog(ctx, sessionId)
+    const { events, header, projections } = await readLog(ctx, sessionId)
     const origin = resolveOrigin(events, turn)
     if (origin.ok !== true) return json(origin)
 
@@ -383,10 +383,25 @@ async function handleCommit(ctx, request) {
     if (origin.first === true) {
       const workspaceId = workspaceOwnerOf(ctx, sessionId)
       const cwd = typeof header?.cwd === 'string' && header.cwd.length > 0 ? header.cwd : undefined
+      // 源会话的 agent 预设要跟着走：create 不带 agentPreset 会落到默认预设，
+      // 极简模式里重试第一轮就会「模式变了」。fork 那条路由宿主自己继承，不用管。
+      //
+      // 预设取「当前」而不是「创建时」：会话 header 里记的是**创建那一刻**的预设，
+      // 之后用户可能通过 agent-preset/selected 切过（极简模式就是这么进的），
+      // 所以 header 会过期。投影（projections.values.agentPreset）才是当前值，
+      // 和宿主 fork 路由的 presetForObservation 看的是同一份数据。投影拿不到
+      // （老会话 / 非预设部署）再退回 header。
+      const preset =
+        (typeof projections?.values?.agentPreset === 'string' && projections.values.agentPreset.length > 0
+          ? projections.values.agentPreset
+          : typeof header?.agentPreset === 'string' && header.agentPreset.length > 0
+            ? header.agentPreset
+            : undefined)
       // 宿主只收一个：给了 workspaceId 就用工作区的 path 当 cwd，并把这个会话挂进该工作区
-      const created = await controller.create(
-        workspaceId !== undefined ? { workspaceId } : cwd !== undefined ? { cwd } : {}
-      )
+      const created = await controller.create({
+        ...(workspaceId !== undefined ? { workspaceId } : cwd !== undefined ? { cwd } : {}),
+        ...(preset !== undefined ? { agentPreset: preset } : {})
+      })
       childId = created.sessionId
       kind = 'create'
     } else {
