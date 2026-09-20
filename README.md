@@ -123,20 +123,28 @@ dist/
 │   │   ├── gitbash-shell.mjs        # 插件本体（host 半边）
 │   │   └── README.md
 │   ├── usage/                       # 内置插件：token 用量统计
+│   │   ├── manifest.json
+│   │   ├── cordis.patch.yml         # 只插 host 半边
+│   │   ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
+│   │   ├── usage.mjs                # host 半边：采集 + 读取接口
+│   │   ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
+│   │   └── README.md
+│   ├── lan_access/                  # 内置插件：局域网扫码访问
+│   │   ├── manifest.json
+│   │   ├── cordis.patch.yml         # 只插 host 半边（刻意不改 webserver 的 host）
+│   │   ├── package.json
+│   │   ├── lan_access.mjs           # host 半边：访问码/开关落盘 + 起停代理 + 读取/开关/重置接口
+│   │   ├── lib/proxy.mjs            # 带鉴权的反向代理（HTTP + WebSocket）
+│   │   ├── lib/qr.mjs               # 纯 JS 二维码编码器 → SVG
+│   │   ├── lib/client.js            # 浏览器半边：侧边栏入口（独占一行）+ 二维码/开关面板
+│   │   └── README.md
+│   └── retry/                       # 内置插件：消息编辑 / 重试
 │       ├── manifest.json
 │       ├── cordis.patch.yml         # 只插 host 半边
 │       ├── package.json             # 声明 dsh.client → 浏览器半边被自动发现
-│       ├── usage.mjs                # host 半边：采集 + 读取接口
-│       ├── lib/client.js            # 浏览器半边：侧边栏入口 + 堆叠柱状图
-│       └── README.md
-│   └── lan_access/                  # 内置插件：局域网扫码访问
-│       ├── manifest.json
-│       ├── cordis.patch.yml         # 只插 host 半边（刻意不改 webserver 的 host）
-│       ├── package.json
-│       ├── lan_access.mjs           # host 半边：访问码/开关落盘 + 起停代理 + 读取/开关/重置接口
-│       ├── lib/proxy.mjs            # 带鉴权的反向代理（HTTP + WebSocket）
-│       ├── lib/qr.mjs               # 纯 JS 二维码编码器 → SVG
-│       ├── lib/client.js            # 浏览器半边：侧边栏入口（独占一行）+ 二维码/开关面板
+│       ├── retry.mjs                # host 半边：算「切哪儿、原文是什么」的读取接口
+│       ├── lib/origin.mjs           # 纯函数：会话日志 → 切点 + 原文
+│       ├── lib/client.js            # 浏览器半边：消息上的编辑/重试按钮 + 分支重发
 │       └── README.md
 ```
 
@@ -208,6 +216,41 @@ Windows 上把 shell 执行器换成 Git Bash，并把模型看到的 shell 工�
   浏览器半边不用为了显示一张图多背几百行编码器。
 - 首次连不上多半是 **Windows 防火墙**拦了入站，要放行本程序自带的 `node.exe`（私有网络）；
   更多坑与设计取舍见 [dist/plugins/lan_access/README.md](dist/plugins/lan_access/README.md)。
+
+### 内置：`retry`
+
+每条**用户消息**的复制按钮旁边多两个按钮：**编辑**（弹出编辑框，预填这轮消息的原文）
+和**重试**（原文重发）。两者的效果都是**从这一轮之前新建一个分支，把消息作为新的一轮
+发出去** —— 原会话原样保留，新分支出现在同一个工作区分组里（标题自增），界面自动切过去。
+
+- **为什么是新建分支**：dsh 的会话日志是只追加的。日志之上那层 surface 虽然能追加
+  `replace` 把旧轮次从**模型可见**的历史里抹掉，但**界面不认**（可见记录只由 `append`
+  事件拼出来），真那么做就是「你看得见旧回答、模型看不见」。所以照搬内置「分支」按钮
+  的做法：在目标轮次之前切一刀，在新分支里重新发一轮。代价是每次重试多一个会话。
+- **切点**：宿主 `session.fork` 的语义是「第一个 seq ≥ atSeq 的 `turn/end`」，
+  所以 `atSeq` 要指到**前一轮的 `turn/end`**，切出来的分支才正好停在这一轮之前。
+  第一轮没有前一轮可指 → 改成新建一个同目录会话；这一轮还在生成 → 先
+  `session.cancel()`（和停止按钮同一个调用）再切。
+- **原文从日志取、不从界面读**：界面上的气泡是渲染过的（`@文件` 变成 chip、空白折叠），
+  拿它的文本去重发会走形。带附件的消息照样能重试/编辑，**但附件不会跟着走**
+  （重发通道只收浏览器现传的上传回执），弹窗和提示条里都会说明。
+- **分组靠宿主**：侧边栏按**工作区**分组，归属关系只记在工作区那边（会话 header 里没有）。
+  第一轮那条路要新建会话，宿主 `session.create` 只收 `workspaceId` 或 `cwd` 之一 ——
+  给 `cwd` 会得到不属于任何工作区的会话，掉进「未分组」。所以建分支 + 发消息都在
+  宿主做（`sessionController.fork/create/prompt`，也就是浏览器那条 RPC 的同一段代码）。
+- **切完要清一次子会话收件箱**：fork 的切点让这一轮那条用户消息的 inbox 插入 splice
+  落在种子里、配对的移除 splice 留在外面，子会话会把它当**待发**复活（先跑一遍旧消息，
+  再把重发的那条接上）。`agent.cancel(cause, {keepInbox:false})` 清掉。
+- **分支标题挑没被占用的序号**：只按「源标题 +1」的话，连着从同一个会话切两次会得到
+  两个同名的 `xxx (1)`；改成拿现有标题列表算 `max+1`。
+- **按钮是 DOM 注入的**：用户消息那一行没有插槽可挂（`user` 键位是整块替换，
+  `extraActions` 只给助手行）。认 `[data-chat-flow-kind="user"][data-chat-turn]` 那行、
+  插在动作行里复制按钮后面；`MutationObserver` 让它被 React 重建后自己长回来。
+  中途插话（`steering`）和还没有轮次号的本地回显不给按钮。
+- host 半边提供两条接口：`GET .../origin` 只读地算「切哪儿、原文是什么」，
+  `POST .../commit` 真正建分支 + 发消息；浏览器半边只负责刷列表和把界面切过去。
+  **改完这个插件要重启服务**（`patchReload: live` 对插件文件不生效，重启最稳）。
+- 详细取舍、DOM 契约和自测见 [dist/plugins/retry/README.md](dist/plugins/retry/README.md)。
 
 ## 两个容易踩的坑
 
@@ -300,6 +343,7 @@ dsh 那 3.0 秒里：
     --plugins-dir <临时插件目录> --dsh-home <临时 dsh 目录>
 
 <venv>/Scripts/python.exe src/tools/probe_lan_access.py          # 局域网访问插件
+<venv>/Scripts/python.exe src/tools/probe_retry.py               # 消息编辑 / 重试插件
 ```
 
 `probe_gui.py` 可以带一个参数：不传跑源码，传 exe 路径就测打包产物。
@@ -310,6 +354,12 @@ dsh 那 3.0 秒里：
 覆盖二维码编码器的已知向量与「生成矩阵 → 反解回原文」、代理的鉴权/头改写/Upgrade 透传/
 收尾不卡住、宿主半边的**默认关闭与开关持久化**（含「重新 import 模拟重启」和状态文件损坏），
 以及浏览器半边在几种数据状态下的渲染冒烟与「入口独占一行」。
+
+`probe_retry.py` 同理，检查本体在 `src/tools/probe_retry_checks.mjs`，全程假日志 / 假 ctx /
+假 DOM / 假 fetch（不起服务、不发请求）。覆盖切点计算的全部边界（第一轮 / 没跑完 / 注入
+上下文 / 只有附件 / 轮次不存在）、宿主接口的参数与错误分支（含观测租约释放、退回活动会话），
+以及浏览器半边的按钮注入幂等、行重建后自己长回来、重试 / 编辑 / 第一轮走新建 / 正在跑先
+cancel / 四类失败路径。
 
 #### 耗时诊断
 
@@ -342,3 +392,18 @@ launch token 换来的 dsh 会话 cookie —— 围栏和鉴权都由代理替�
 想让入口独占一行，只能在挂载时把那个容器的 `flex-wrap` 改成 `wrap`（`lan_access` 就是这么做的）。
 坑在于**不能只看 `parentElement`**：`renderSlot()` 会先套一层 `display:contents` 的锚点，
 盒子不参与布局，改它等于没改 —— 要往上找第一个 computed display 是 `flex` 的祖先。
+
+**每条消息那一行没有插槽**：`conversation.chat.node` 是按 kind 的 keyed 槽（`user` 键位是
+**整块替换**，注册了就顶掉 dsh 自己的用户气泡渲染），`MessageIconActions` 的 `extraActions`
+只往助手行传。想往**用户消息**上加动作只能 DOM 注入，靠 dsh 自己标在行上的三个属性认位置：
+
+| 属性 | 值 | 用途 |
+| --- | --- | --- |
+| `data-chat-flow-kind` | `user` / `steering` / `assistant` / … | 用户自己发的起始消息是 `user`；中途插话是 `steering`（没有「轮」的概念，别给重试按钮） |
+| `data-chat-turn` | 轮次号（整数） | 就是 `turn/start` 事件里的 `turn`，宿主拿它去会话日志里找切点 |
+| `data-chat-anchor-key` / `data-chat-flow-key` | 节点 key | 形如 `input-message:<消息 id>`（**不是** seq），别拿它当事件序号用 |
+
+动作行容器是行里第一个 class 形如 `<hash>_actions` 的 div（CSS Modules 的
+`xzv4MW_actions`，哈希随版本变、后缀不会），「复制」是它里面第一个 `button`。
+按钮插在 React 管的 DOM 里会被重建冲掉，得挂 `MutationObserver` 自己长回来
+（`retry` 就是这么做的）。

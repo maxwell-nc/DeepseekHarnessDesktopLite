@@ -1,0 +1,18 @@
+# dsh profile 补丁片段 —— 由 dsh-ui 的插件管理器拼进
+# <DSH_HOME>/profiles/<profile>/cordis.patch.yml 的托管块里。
+#
+# 本片段是一个 YAML 列表，不要写 YAML 文档头。
+#
+# 只插 host 半边：它负责注册 `GET /api/dsh-ui-retry.origin`（算「从哪儿切、
+# 原文是什么」）。真正干活的浏览器半边（lib/client.js）不需要在这里声明 ——
+# dsh 的 client-modules 会按包清单里的 `dsh.client` 字段自动发现它，
+# 见同目录 package.json。
+#
+# `name` 是相对 **profile 目录** 的路径 —— 管理器把插件包复制到
+# <profile>/plugins/retry/ 之后这个相对路径才成立。
+#
+# `name` 只能写纯字符串：patch loader 拿到 `!!js` 表达式对象时 name.startsWith
+# 会直接崩（gitbash 插件踩过，见它的 README）。
+- insert:
+    - id: dsh-ui-retry
+      name: ./plugins/retry/retry.mjs
