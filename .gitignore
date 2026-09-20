@@ -14,7 +14,9 @@ dist/*
 dist/plugins/*/data/
 
 # 本地插件：只在本机用，不进版本库（插件管理器照常扫得到它）
-dist/plugins/dsh-cf/
+# 第三方插件目录整体忽略：里面的插件（如 dsh-cf、review）不提交 git，
+# 但外壳启动时和 plugins/ 一起扫描、一起参与加载，管理器里标「第三方」。
+dist/plugins-third-party/
 
 # ─────────────────────────────────────────────────────────────
 # Python

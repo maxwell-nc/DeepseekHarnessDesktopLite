@@ -43,6 +43,7 @@ dist/                        整个目录就是程序目录，一起分发
 ├── DeepSeekHarness.exe      启动器
 ├── _internal/               Python 运行时 + 依赖 + runtime/dsh_fastboot.mjs
 ├── plugins/                 插件源码，进版本库
+├── plugins-third-party/     第三方插件（本机私有，不进版本库，照常加载）
 └── node/                    自带的 Node 26（win-x64 zip 摊平），不进版本库
 ```
 
@@ -67,12 +68,15 @@ dist/                        整个目录就是程序目录
 ├── DeepSeekHarness.exe      启动器，不能单独拷出来用
 ├── _internal/               Python 运行时 + 依赖 + runtime/dsh_fastboot.mjs
 ├── plugins/                 插件源码（运行时直接读这份）
+├── plugins-third-party/     第三方插件（本机私有，不进版本库，照常加载）
 └── node/                    自带的 Node 26
 ```
 
 **分发要把整个 `dist/` 压成 zip。**
 
-插件按**源码**放在 `dist/plugins/`（进版本库），**不打包进 exe**。
+插件按**源码**放在 `dist/plugins/`（进版本库），**不打包进 exe**。本机私有的
+第三方插件放 `dist/plugins-third-party/`（被 `.gitignore` 整体忽略，不进版本库），
+外壳启动时两个目录一起扫描、一起参与加载，插件管理器里第三方插件带「第三方」徽标。
 
 自带 Node 要**手工准备**（构建脚本不下载）：从 nodejs.org 下 win-x64 的 zip，把解压出来的
 `node-v26.x.x-win-x64/` **里面的内容**（`node.exe`、`node_modules/`、`npm.cmd` 等）直接铺到
@@ -113,7 +117,10 @@ dist/                        整个目录就是程序目录
 ## 插件
 
 插件包放在 **exe 同目录的 `plugins/`**（onedir 下就是 `dist/plugins/`，
-壳运行时直接读这份，构建脚本不搬运），一个插件一个子目录：
+壳运行时直接读这份，构建脚本不搬运），一个插件一个子目录。
+**第三方插件**放在旁边的 `plugins-third-party/`（同样在 exe 同目录，开发态是
+`dist/plugins-third-party/`）：目录整体被 `.gitignore` 忽略、不提交 git，但外壳
+照常扫描、照常参与加载，插件管理器里会标「第三方」徽标。两个目录的包结构完全一样：
 
 ```
 dist/
@@ -147,11 +154,16 @@ dist/
 │   │   ├── lib/origin.mjs           # 纯函数：会话日志 → 切点 + 原文
 │   │   ├── lib/client.js            # 浏览器半边：消息上的编辑/重试按钮 + 分支重发
 │   │   └── README.md
+│   └── …                            # 其余内置插件
+└── plugins-third-party/             # 第三方插件：本机私有，不进版本库，照常加载
+    ├── dsh-cf/                      # 例：CodeFree-O 反代（本机私有）
+    └── review/                      # 例：待处理改动审查（本机私有）
 ```
 
 **装进 dsh 的规则**（dsh-ui 每次启动、以及管理器点「重启」时执行）：
 
-1. 扫 `plugins/` 下所有带 `manifest.json` 的包；没记录过的插件默认**开启**；
+1. 扫 `plugins/` **和** `plugins-third-party/` 下所有带 `manifest.json` 的包
+   （第三方目录不存在就跳过）；没记录过的插件默认**开启**；
 2. 开启的包 → 整目录镜像到 `%USERPROFILE%\.dsh\profiles\web\plugins\<id>\`
    （源目录没变就跳过复制，靠 `.dsh-ui-plugin.json` 指纹判断；包**根目录**下的 `data/`
    是插件的运行态，既不复制也不进指纹 —— 插件自己的数据放 `<数据目录>/data/`）；

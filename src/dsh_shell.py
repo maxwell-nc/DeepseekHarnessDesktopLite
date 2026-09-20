@@ -725,13 +725,27 @@ PATCH_HEADER = (
 
 
 def plugins_dir():
-    """插件包目录：exe 同目录的 plugins/。开发态回落到项目里的 dist/plugins。"""
+    """内置插件包目录：exe 同目录的 plugins/。开发态回落到项目里的 dist/plugins。"""
     override = (os.environ.get("DSH_UI_PLUGINS_DIR") or "").strip()
     if override:
         return os.path.abspath(os.path.expanduser(override))
     if getattr(sys, "frozen", False):
         return os.path.join(BASE_DIR, "plugins")
     return os.path.join(os.path.dirname(BASE_DIR), "dist", "plugins")
+
+
+def third_party_plugins_dir():
+    """第三方插件包目录：exe 同目录的 plugins-third-party/（不进版本库）。
+
+    开发态回落到项目里的 dist/plugins-third-party/。目录不存在时返回 None，
+    调用方按「没有第三方插件」处理。
+    """
+    override = (os.environ.get("DSH_UI_THIRD_PARTY_PLUGINS_DIR") or "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if getattr(sys, "frozen", False):
+        return os.path.join(BASE_DIR, "plugins-third-party")
+    return os.path.join(os.path.dirname(BASE_DIR), "dist", "plugins-third-party")
 
 
 def dsh_home():
@@ -831,11 +845,14 @@ def _strip_comments(text):
 
 
 class PluginPackage(object):
-    """plugins/ 里的一个插件包。读 manifest，做基本校验，坏了就带着原因展示。"""
+    """plugins/ 或 plugins-third-party/ 里的一个插件包。读 manifest，做基本校验，
+    坏了就带着原因展示。third_party 标记它来自第三方目录（不进版本库）。
+    """
 
-    def __init__(self, path):
+    def __init__(self, path, third_party=False):
         self.path = path
         self.id = os.path.basename(path)
+        self.third_party = bool(third_party)
         self.name = self.id
         self.description = ""
         self.version = ""
@@ -890,9 +907,8 @@ class PluginPackage(object):
         return self.error is None and self.platform_ok
 
 
-def scan_plugin_packages():
-    """扫描 plugins/，按 order 排好序返回（坏包也在列表里，带 error）。"""
-    root = plugins_dir()
+def _scan_dir(root, third_party=False):
+    """扫一个插件目录，返回里面的包（坏包也在列表里，带 error）。"""
     found = []
     try:
         names = sorted(os.listdir(root))
@@ -903,7 +919,20 @@ def scan_plugin_packages():
             continue
         path = os.path.join(root, name)
         if os.path.isdir(path):
-            found.append(PluginPackage(path))
+            found.append(PluginPackage(path, third_party=third_party))
+    return found
+
+
+def scan_plugin_packages():
+    """扫描 plugins/ 与 plugins-third-party/，按 order 排好序返回。
+
+    第三方目录不存在时静默跳过；两个目录里的包都参与加载，只是第三方包
+    带 third_party 标记（插件管理器里显示「第三方」徽标）。
+    """
+    found = _scan_dir(plugins_dir(), third_party=False)
+    third = third_party_plugins_dir()
+    if third:
+        found.extend(_scan_dir(third, third_party=True))
     found.sort(key=lambda item: (item.order, item.id))
     return found
 
@@ -1804,6 +1833,7 @@ MANAGER_HTML = """<!doctype html>
   }
   .state-on { color: var(--on); border-color: rgba(17, 158, 106, .38); }
   .state-off { color: var(--off); border-color: rgba(214, 60, 76, .3); }
+  .third { color: #8a5a00; border-color: rgba(166, 102, 0, .38); background: rgba(255, 244, 214, .5); }
   .desc { margin-top: 6px; font-size: 12px; color: #5b6478; line-height: 1.65; }
   .warn { margin-top: 6px; font-size: 11.5px; color: #a8660d; line-height: 1.6; }
   .empty { color: var(--dim); text-align: center; padding: 40px 10px; line-height: 1.8; }
@@ -1835,6 +1865,7 @@ MANAGER_HTML = """<!doctype html>
     <h1>插件管理器</h1>
     <div class="paths">
       插件目录 <b id="p-plugins">…</b><br>
+      第三方插件目录 <b id="p-third">…</b><br>
       dsh 目录 <b id="p-dsh">…</b>
     </div>
   </header>
@@ -1843,6 +1874,7 @@ MANAGER_HTML = """<!doctype html>
     <div class="acts">
       <button class="primary" id="restart">重启服务并生效</button>
       <button class="ghost" id="open-plugins">打开插件目录</button>
+      <button class="ghost" id="open-third">打开第三方插件目录</button>
       <button class="ghost" id="open-dsh">打开 dsh 目录</button>
       <button class="ghost" id="open-log">查看日志</button>
     </div>
@@ -1866,18 +1898,21 @@ MANAGER_HTML = """<!doctype html>
 
   function render(state) {
     document.getElementById('p-plugins').textContent = state.pluginsDir || '(无)';
+    document.getElementById('p-third').textContent = state.thirdPartyPluginsDir || '(无)';
     document.getElementById('p-dsh').textContent = state.dshHome || '(无)';
 
     var list = document.getElementById('list');
     if (!state.plugins || state.plugins.length === 0) {
       list.innerHTML = '<div class="empty">插件目录里还没有插件包。<br>'
-        + '每个插件是一个子目录，里面要有 manifest.json、入口 .mjs 和 patch 片段。</div>';
+        + '每个插件是一个子目录，里面要有 manifest.json、入口 .mjs 和 patch 片段。<br>'
+        + '第三方插件放在「第三方插件目录」（不进版本库），同样会被扫描加载。</div>';
     } else {
       list.innerHTML = state.plugins.map(function (p) {
         var cls = 'led ' + (p.enabled ? 'on' : 'off');
         var chip = p.enabled
           ? '<span class="chip state-on">已启用</span>'
           : '<span class="chip state-off">已关闭</span>';
+        var third = p.thirdParty ? '<span class="chip third">第三方</span>' : '';
         var inst = p.installed ? '<span class="chip">已装入 dsh</span>' : '';
         var ver = p.version ? '<span class="chip">v' + esc(p.version) + '</span>' : '';
         var warn = p.error ? '<div class="warn">⚠ ' + esc(p.error) + '</div>' : '';
@@ -1886,7 +1921,7 @@ MANAGER_HTML = """<!doctype html>
           + '<button class="' + cls + '" data-id="' + esc(p.id) + '" data-on="' + (p.enabled ? '1' : '0') + '" title="点击切换"></button>'
           + '<div class="meta">'
           + '<div class="title"><span class="name">' + esc(p.name) + '</span>'
-          + '<span class="id">' + esc(p.id) + '</span>' + ver + chip + inst + '</div>'
+          + '<span class="id">' + esc(p.id) + '</span>' + third + ver + chip + inst + '</div>'
           + (p.description ? '<div class="desc">' + esc(p.description) + '</div>' : '')
           + warn
           + '</div></div>';
@@ -1939,6 +1974,7 @@ MANAGER_HTML = """<!doctype html>
   function bind() {
     document.getElementById('restart').addEventListener('click', restart);
     document.getElementById('open-plugins').addEventListener('click', function () { api.open_plugins_dir(); });
+    document.getElementById('open-third').addEventListener('click', function () { api.open_third_party_plugins_dir(); });
     document.getElementById('open-dsh').addEventListener('click', function () { api.open_dsh_dir(); });
     document.getElementById('open-log').addEventListener('click', function () { api.open_log(); });
   }
@@ -2103,11 +2139,13 @@ class DshShellApp(object):
                     "usable": package.usable,
                     "error": package.error,
                     "installed": os.path.isfile(os.path.join(dest, PLUGIN_STAMP)),
+                    "thirdParty": package.third_party,
                 }
             )
         return {
             "plugins": rows,
             "pluginsDir": plugins_dir(),
+            "thirdPartyPluginsDir": third_party_plugins_dir(),
             "dshHome": dsh_home(),
             "profileDir": profile_dir,
             "status": self.plugin_status,
@@ -2515,6 +2553,16 @@ class PluginManagerApi(object):
             pass
         self._app._open_path(path)
 
+    def open_third_party_plugins_dir(self):
+        path = third_party_plugins_dir()
+        if not path:
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+        self._app._open_path(path)
+
     def open_dsh_dir(self):
         self._app._open_path(dsh_home())
 
@@ -2832,6 +2880,7 @@ def main():
     log("%s v%s 启动 (frozen=%s, pid=%s)" % (APP_NAME, APP_VERSION, getattr(sys, "frozen", False), os.getpid()))
     log("数据目录: %s" % DATA_DIR)
     log("插件目录: %s" % plugins_dir())
+    log("第三方插件目录: %s" % (third_party_plugins_dir() or "(无)"))
     log("dsh 目录: %s" % dsh_home())
     log("node: %s" % find_node())
     mark("main() 开始（frozen=%s）" % getattr(sys, "frozen", False))

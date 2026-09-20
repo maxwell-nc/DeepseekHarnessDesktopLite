@@ -77,6 +77,9 @@ def main():
             )
             check("插件目录指向 dist/plugins", "plugins" in (state.get("pluginsDir") or ""),
                   state.get("pluginsDir", ""))
+            check("第三方插件目录指向 dist/plugins-third-party",
+                  "plugins-third-party" in (state.get("thirdPartyPluginsDir") or ""),
+                  state.get("thirdPartyPluginsDir", ""))
             check("dsh 目录是 ~/.dsh", (state.get("dshHome") or "").endswith(".dsh"),
                   state.get("dshHome", ""))
 

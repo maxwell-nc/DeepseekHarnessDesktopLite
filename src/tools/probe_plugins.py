@@ -44,6 +44,7 @@ if DSH_HOME_DIR:
 
 def main():
     print("插件目录 : %s" % dsh_shell.plugins_dir())
+    print("第三方目录: %s" % (dsh_shell.third_party_plugins_dir() or "(无)"))
     print("dsh 目录  : %s" % dsh_shell.dsh_home())
     print("profile  : %s" % dsh_shell.plugin_profile_dir())
     print("状态文件 : %s" % dsh_shell.PLUGIN_STATE_FILE)
@@ -55,9 +56,10 @@ def main():
     for package in packages:
         flag = "可用" if package.usable else "不可用"
         enabled = "开" if dsh_shell.plugin_enabled(state, package) else "关"
+        source = "第三方" if package.third_party else "内置"
         print(
-            "  - %-12s order=%-4s v%-8s [%s/%s] %s"
-            % (package.id, package.order, package.version, flag, enabled, package.name)
+            "  - %-12s order=%-4s v%-8s [%s/%s/%s] %s"
+            % (package.id, package.order, package.version, source, flag, enabled, package.name)
         )
         if package.error:
             print("      ! %s" % package.error)

@@ -45,16 +45,22 @@ BUNDLED_NODE = os.path.join(DIST, "node")                  # 手工放的自带 
 
 
 def plugin_report():
-    """dist/plugins 是插件源码目录，顺带报一下有几个包。"""
-    if not os.path.isdir(PLUGINS):
-        print("[build] 注意：%s 不存在，产物里没有插件可加载" % PLUGINS)
-        return []
-    names = [
-        name
-        for name in sorted(os.listdir(PLUGINS))
-        if os.path.isfile(os.path.join(PLUGINS, name, "manifest.json"))
-    ]
+    """dist/plugins 是插件源码目录，顺带报一下有几个包（含第三方目录）。"""
+    def _names(root):
+        if not os.path.isdir(root):
+            return []
+        return [
+            name
+            for name in sorted(os.listdir(root))
+            if os.path.isfile(os.path.join(root, name, "manifest.json"))
+        ]
+
+    names = _names(PLUGINS)
+    third = _names(os.path.join(DIST, "plugins-third-party"))
     print("[build] 插件源码： %s（%d 个包：%s）" % (PLUGINS, len(names), "、".join(names) or "空"))
+    if third:
+        print("[build] 第三方插件： %s（%d 个包：%s，不进版本库）"
+              % (os.path.join(DIST, "plugins-third-party"), len(third), "、".join(third)))
     return names
 
 
