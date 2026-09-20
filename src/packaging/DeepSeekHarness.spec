@@ -21,6 +21,7 @@ import os
 # SPECPATH = <项目根>/src/packaging
 SRC = os.path.abspath(os.path.join(SPECPATH, ".."))       # <项目根>/src
 ICON = os.path.join(SRC, "assets", "app.ico")
+MANIFEST = os.path.join(SPECPATH, "app.manifest")         # DPI 感知清单
 
 # 启动加速补丁：node --import 要求它是磁盘上的真实文件，必须打进包里，
 # 运行时从 sys._MEIPASS/runtime/ 取。
@@ -89,6 +90,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON if os.path.isfile(ICON) else None,
+    manifest=MANIFEST if os.path.isfile(MANIFEST) else None,
 )
 
 # onedir 产物： dist/DeepSeekHarness/DeepSeekHarness.exe + _internal/

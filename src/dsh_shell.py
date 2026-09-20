@@ -622,6 +622,71 @@ def save_config(cfg):
             log("保存配置失败: %s" % exc)
 
 
+# --------------------------------------------------------------------------- #
+# 主窗口位置记忆
+#
+# 默认每次启动都用 CenterScreen 居中；用户手动挪过窗口后，把位置/尺寸记到
+# config.json，下次启动恢复，避免"每次打开位置都不一样"。
+# --------------------------------------------------------------------------- #
+
+WINDOW_GEOMETRY_KEYS = ("window_x", "window_y", "window_w", "window_h")
+
+
+def load_window_geometry():
+    """读回上次的主窗口几何。返回 (x, y, w, h) 或 None（没有/非法）。"""
+    cfg = load_config()
+    try:
+        x = int(cfg["window_x"])
+        y = int(cfg["window_y"])
+        w = int(cfg["window_w"])
+        h = int(cfg["window_h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w < 200 or h < 200:
+        return None
+    return x, y, w, h
+
+
+def save_window_geometry(x, y, w, h):
+    """把主窗口几何写进 config.json（只更新这四个键，不动其它配置）。"""
+    try:
+        cfg = load_config()
+        cfg["window_x"] = int(x)
+        cfg["window_y"] = int(y)
+        cfg["window_w"] = int(w)
+        cfg["window_h"] = int(h)
+        save_config(cfg)
+    except Exception as exc:  # noqa: BLE001
+        log("保存窗口位置失败: %s" % exc)
+
+
+def clamp_window_geometry(x, y, w, h):
+    """把恢复的窗口位置夹回当前可见屏幕内，避免拔掉副屏后窗口跑到屏幕外。
+
+    只保证窗口左上角落在虚拟屏幕范围内（并留出标题栏余量）；尺寸不变。
+    拿不到屏幕信息时原样返回。坐标一律用逻辑像素（与保存/恢复一致）。
+    """
+    try:
+        import webview
+
+        screens = webview.screens()
+        if not screens:
+            return x, y, w, h
+        vx = min(s.x for s in screens)
+        vy = min(s.y for s in screens)
+        vw = max(s.x + s.width for s in screens) - vx
+        vh = max(s.y + s.height for s in screens) - vy
+    except Exception:  # noqa: BLE001
+        return x, y, w, h
+    if vw <= 0 or vh <= 0:
+        return x, y, w, h
+    # 至少让标题栏（约 40px）留在屏幕内
+    margin = 40
+    cx = min(max(x, vx - w + margin), vx + vw - margin)
+    cy = min(max(y, vy - margin), vy + vh - margin)
+    return cx, cy, w, h
+
+
 def effective_registry():
     """返回本次 npm 调用要用的 registry；空串表示交给系统 npm 配置决定。"""
     value = (load_config().get("registry") or "").strip()
@@ -1902,6 +1967,9 @@ class DshShellApp(object):
         # 插件管理器窗口底部那行状态文字
         self.plugin_status = ""
         self.plugin_error = False
+        # 主窗口几何记忆：_last_geometry 记录最近一次已知的 (x, y, w, h)，
+        # 退出/重启时写回 config.json。None 表示还没拿到过。
+        self._last_geometry = None
 
     def set_plugin_status(self, text, error=False):
         self.plugin_status = str(text or "")
@@ -1934,11 +2002,35 @@ class DshShellApp(object):
 
     # ---------------- 窗口 ---------------- #
 
+    def _capture_geometry(self):
+        """从 pywebview 窗口读当前几何（逻辑像素），存到 _last_geometry。
+
+        读不到就保持原值，不覆盖上次已知值。
+        """
+        window = self.window
+        if window is None:
+            return
+        try:
+            x, y = window.x, window.y
+            w, h = window.width, window.height
+        except Exception:  # noqa: BLE001
+            return
+        if w > 0 and h > 0:
+            self._last_geometry = (x, y, w, h)
+
+    def _save_geometry(self):
+        """把最近一次已知几何写进 config.json（幂等，可反复调）。"""
+        if self._last_geometry is None:
+            return
+        save_window_geometry(*self._last_geometry)
+
     def on_window_closing(self):
         """点关闭按钮 -> 收进托盘，不退出程序。"""
         if self.quitting:
             return True
         log("窗口关闭 -> 最小化到托盘")
+        self._capture_geometry()
+        self._save_geometry()
         try:
             self.window.hide()
         except Exception as exc:  # noqa: BLE001
@@ -2334,6 +2426,10 @@ class DshShellApp(object):
         self.quitting = True
         log("退出：先把界面撤掉，再清理后台")
 
+        # 退出前把主窗口几何记下来（重启应用/退出都走这里）
+        self._capture_geometry()
+        self._save_geometry()
+
         # 第一步只做「让用户看到程序已经关了」：隐藏窗口 + 停托盘。
         # 这两步都是毫秒级，所以点完「退出」界面几乎立刻消失。
         for name in ("window", "manager_window"):
@@ -2480,18 +2576,39 @@ def main():
     # 启动期唯一的界面 = 主窗口里那层原生 loading，必须在 webview.start() 之前挂上。
     patch_webview_loading()
 
-    window = webview.create_window(
-        APP_NAME,
-        html=BLANK_HTML,
-        width=1280,
-        height=860,
-        min_size=(940, 620),
-        background_color=WINDOW_BG,
-        text_select=True,
-    )
+    # 主窗口几何：上次退出时记过就恢复（位置/尺寸），否则用默认尺寸居中。
+    # 恢复的坐标是逻辑像素，pywebview 会按 DPI 换算成物理像素。
+    geometry = load_window_geometry()
+    if geometry is not None:
+        gx, gy, gw, gh = clamp_window_geometry(*geometry)
+        log("恢复主窗口几何: (%d, %d) %dx%d" % (gx, gy, gw, gh))
+        window = webview.create_window(
+            APP_NAME,
+            html=BLANK_HTML,
+            width=gw,
+            height=gh,
+            x=gx,
+            y=gy,
+            min_size=(940, 620),
+            background_color=WINDOW_BG,
+            text_select=True,
+        )
+    else:
+        window = webview.create_window(
+            APP_NAME,
+            html=BLANK_HTML,
+            width=1280,
+            height=860,
+            min_size=(940, 620),
+            background_color=WINDOW_BG,
+            text_select=True,
+        )
     app.window = window
     window.events.closing += app.on_window_closing
     window.events.loaded += lambda: mark("页面加载完成")
+    # 用户拖动/缩放窗口时持续记录几何，退出时写回
+    window.events.moved += lambda *_: app._capture_geometry()
+    window.events.resized += lambda *_: app._capture_geometry()
     mark("主窗口对象已建（尚未真正创建 WebView2）")
 
     # 插件管理器：先建好、隐藏着，托盘菜单点开再 show()。
