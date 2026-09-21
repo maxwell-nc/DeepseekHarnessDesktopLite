@@ -1,0 +1,17 @@
+{
+  "name": "dsh-loop-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh 思考循环守卫插件（宿主半边：llm/stream 监听 + 循环检测 + 自动中断 + /api 状态接口；web 客户端半边：右下角悬浮面板）",
+  "exports": {
+    ".": "./loop_guard.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

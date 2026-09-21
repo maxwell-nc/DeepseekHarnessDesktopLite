@@ -1,0 +1,10 @@
+{
+  "id": "thinking_loop_guard",
+  "name": "思考循环守卫",
+  "description": "实时检测模型思考内容的死循环（精确重复 / 相似回声 / 退化重复三类），命中后自动中断本轮并保留已生成的部分思考，避免无效烧 token；网页右下角悬浮面板可查看监控状态与命中记录，可随时关闭自动中断。",
+  "version": "1.0.0",
+  "order": 50,
+  "entry": "loop_guard.mjs",
+  "patch": "cordis.patch.yml",
+  "requiresRestart": true
+}
