@@ -63,6 +63,8 @@ window.__ModuleLoader__.load({
 		const STATE_API = "/api/dsh-loop-guard.state";
 		/** 切自动中断开关（POST，有副作用）。 */
 		const MODE_API = "/api/dsh-loop-guard.mode";
+		/** 浏览器已跳转到新分支（POST {childId}），宿主清掉待跳转标记。 */
+		const OPENED_API = "/api/dsh-loop-guard.opened";
 		/** 轮询节奏。 */
 		const POLL_MS = 2500;
 		/** 入场脉冲持续多久后撤掉动画类（9 次 × 1.5s ≈ 13.5s）。 */
@@ -77,13 +79,14 @@ window.__ModuleLoader__.load({
 			'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>';
 
 		const KIND_LABEL = { exact: "精确重复", fuzzy: "相似回声", degenerate: "退化重复" };
-		const ACTION_LABEL = { cancelled: "已中断", truncated: "已截断", none: "仅记录", warned: "预警" };
+		const ACTION_LABEL = { cancelled: "已中断", truncated: "已截断", branched: "分支重跑", none: "仅记录", warned: "预警" };
 
-		/** 插件运行态（apply 时填）。单页单实例。 */
+		/** 插件运行态（apply 时填）。单页单实例。sessions 由 inject 提供。 */
 		const state = {
 			panel: null, btn: null, badge: null, fallbackRoot: null,
 			open: false, timer: null, pulseTimer: null, fallbackTimer: null,
-			observer: null, sweepTimer: null, data: null, busy: false, anchored: false
+			observer: null, sweepTimer: null, data: null, busy: false, anchored: false,
+			ackHits: 0, sessions: null, pendingOpen: null, ackedChild: null, openBusy: false
 		};
 
 		/** 建一个元素（textContent 赋值，模型内容永不走 innerHTML）。 */
@@ -104,6 +107,8 @@ window.__ModuleLoader__.load({
 			btn.appendChild(badge);
 			btn.addEventListener("click", () => {
 				state.open = !state.open;
+				// 点击即视为已读：清掉红色角标；新命中到达后重新显示
+				state.ackHits = currentHits();
 				render();
 			});
 			state.btn = btn;
@@ -204,7 +209,7 @@ window.__ModuleLoader__.load({
 			head.appendChild(el("span", "tlg-time", fmtTime(item.at)));
 			head.appendChild(el("span", "tlg-model", item.model || item.provider || "未知模型"));
 			head.appendChild(el("span", "tlg-chip tlg-kind", KIND_LABEL[item.kind] || String(item.kind)));
-			head.appendChild(el("span", "tlg-chip" + (action === "cancelled" || action === "truncated" ? " tlg-hit" : ""), ACTION_LABEL[action] || action));
+			head.appendChild(el("span", "tlg-chip" + (action === "cancelled" || action === "truncated" || action === "branched" ? " tlg-hit" : ""), ACTION_LABEL[action] || action));
 			row.appendChild(head);
 			if (item.detail) row.appendChild(el("div", "tlg-detail", item.detail));
 			if (item.sample) {
@@ -215,10 +220,17 @@ window.__ModuleLoader__.load({
 			return row;
 		}
 
+		/** 累计命中数（cancelled/truncated/branched 的记录条数）。 */
+		function currentHits() {
+			const data = state.data;
+			const detections = (data !== null && data !== undefined && Array.isArray(data.detections)) ? data.detections : [];
+			return detections.filter((item) => item.action === "cancelled" || item.action === "truncated" || item.action === "branched").length;
+		}
+
 		function render() {
 			const data = state.data;
 			const detections = (data !== null && data !== undefined && Array.isArray(data.detections)) ? data.detections : [];
-			const hits = detections.filter((item) => item.action === "cancelled" || item.action === "truncated").length;
+			const hits = currentHits();
 			const streaming = data !== null && data !== undefined && data.activeStreams > 0;
 			// 按钮角标：命中数（红）优先，其次流式进行中（蓝点）；自动中断开启时图标变绿
 			const on = data !== null && data !== undefined && data.autoInterrupt === true;
@@ -226,7 +238,9 @@ window.__ModuleLoader__.load({
 				state.btn.classList.toggle("tlg-on", on);
 			}
 			if (state.badge !== null && state.badge !== undefined) {
-				state.badge.textContent = hits > 0 ? String(hits) : "";
+				// 只显示未读命中：点击后已读数对齐，宿主重启清零时也跟着对齐
+				if (hits < state.ackHits) state.ackHits = hits;
+				state.badge.textContent = hits > state.ackHits ? String(hits) : "";
 				state.badge.className = "tlg-badge" + (hits === 0 && streaming ? " tlg-live" : "");
 			}
 			if (state.panel === null || state.panel === undefined) return;
@@ -246,7 +260,7 @@ window.__ModuleLoader__.load({
 				? (data.activeStreams > 0 ? "监控中 · " + data.activeStreams + " 路流" : "空闲待命") + " · 累计 " + data.seen + " 次调用"
 				: "连接中…";
 			state.panel.appendChild(el("div", "tlg-live", live));
-			state.panel.appendChild(el("div", "tlg-note", "实时分析流式思考内容：精确重复 / 相似回声 / 退化重复。命中后中断本轮并保留已生成的部分思考。"));
+			state.panel.appendChild(el("div", "tlg-note", "实时分析流式思考内容：精确重复 / 相似回声 / 退化重复。首次命中自动分支重跑一次（新分支会自动打开，循环的那次留在原会话）；新分支里再循环才中断本轮。"));
 			if (detections.length === 0) {
 				state.panel.appendChild(el("div", "tlg-empty", "尚未检测到思考循环"));
 				return;
@@ -254,6 +268,48 @@ window.__ModuleLoader__.load({
 			const list = el("div", "tlg-list");
 			for (const item of detections.slice(0, 8)) list.appendChild(detectionItem(item));
 			state.panel.appendChild(list);
+		}
+
+		/**
+		 * 宿主刚分支重跑出一个新会话：refresh + open 把用户带过去（retry 的同款
+		 * 流程）。列表还没落进 store 时 open 会失败 —— 跨轮询最多试 3 次，成功后
+		 * POST /opened 让宿主清掉待跳转标记。
+		 */
+		async function handlePendingChild() {
+			const data = state.data;
+			const child = data !== null && data !== undefined && typeof data.pendingChild === "string" ? data.pendingChild : "";
+			if (child.length === 0 || child === state.ackedChild) return;
+			const sessions = state.sessions;
+			if (sessions === null || sessions === undefined || typeof sessions.open !== "function") return;
+			if (state.pendingOpen === null || state.pendingOpen.childId !== child) {
+				state.pendingOpen = { childId: child, tries: 0 };
+			}
+			const pending = state.pendingOpen;
+			if (pending.busy === true || pending.tries >= 3) return;
+			pending.tries += 1;
+			pending.busy = true;
+			try {
+				try {
+					await sessions.refresh();
+				} catch {
+					// 刷新失败也接着试 open（可能列表本来就更新过了）
+				}
+				sessions.open(child);
+				state.ackedChild = child;
+				try {
+					await fetch(OPENED_API, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ childId: child })
+					});
+				} catch {
+					// 通知失败最多多跳一次，无副作用
+				}
+			} catch {
+				// 这一轮没跳成，下个轮询周期再试
+			} finally {
+				pending.busy = false;
+			}
 		}
 
 		async function poll() {
@@ -268,6 +324,7 @@ window.__ModuleLoader__.load({
 			state.busy = false;
 			sweep();
 			render();
+			handlePendingChild();
 		}
 
 		async function toggleMode() {
@@ -365,12 +422,14 @@ window.__ModuleLoader__.load({
 		/**
 		 * 客户端半边入口。
 		 *
-		 * 不需要任何客户端服务：读状态/切开关都走同源 /api，界面是纯 DOM。
+		 * 需要 sessions：宿主分支重跑出新会话后，由这里 refresh + open 把用户带
+		 * 过去（retry 的同款依赖）。界面本身仍是纯 DOM。
 		 *
 		 * @param ctx - 客户端 root context。
 		 */
 		function apply(ctx) {
 			if (typeof document === "undefined") return;
+			state.sessions = ctx.sessions !== undefined ? ctx.sessions : null;
 			const boot = () => {
 				try {
 					install();
@@ -387,7 +446,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		exports.apply = apply;
-		exports.inject = [];
+		exports.inject = ["sessions"];
 		return module.exports;
 	}
 });

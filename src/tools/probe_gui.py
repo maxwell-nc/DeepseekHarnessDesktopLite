@@ -26,6 +26,9 @@ print("清理上一次残留")
 print("=" * 62)
 sh.DshService().stop()
 
+# 防睡眠标志是进程级的：壳进程退出后系统自动清除，所以这里先确认当前是"未设置"。
+print("启动前防睡眠状态 :", sh._awake_held, "（应为 False）")
+
 log_start = 0
 try:
     log_start = os.path.getsize(sh.SHELL_LOG)
@@ -91,6 +94,17 @@ else:
     print("端口占用 :", sh.pids_on_port())
     print("HTTP 可达:", sh.http_alive())
 
+    # 防睡眠是壳进程内的状态，探针进程里看不到；改从日志确认设置成功。
+    print("\n--- 防睡眠检查 ---")
+    try:
+        with open(sh.SHELL_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(log_start)
+            log_text = fh.read()
+        print("日志含「已阻止系统睡眠」:", "已阻止系统睡眠" in log_text)
+        print("日志含「防睡眠已设置」  :", "防睡眠已设置" in log_text)
+    except OSError as exc:
+        print("读日志失败:", exc)
+
     print("\n--- 发送 WM_CLOSE（模拟点关闭按钮）---")
     user32.PostMessageW(hwnd, WM_CLOSE, None, None)
 
@@ -109,6 +123,15 @@ else:
     print("关闭后窗口可见 :", visible, "（应为 False，即收进托盘）")
     print("壳进程存活     :", proc.poll() is None, "（应为 True）")
     print("服务仍在运行   :", bool(sh.pids_on_port()), "（应为 True）")
+
+    # 收进托盘后防睡眠应仍然保持（服务继续后台跑）
+    try:
+        with open(sh.SHELL_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(log_start)
+            log_text = fh.read()
+        print("托盘驻留后防睡眠仍保持:", "已阻止系统睡眠" in log_text and "已释放防睡眠" not in log_text)
+    except OSError as exc:
+        print("读日志失败:", exc)
 
 print("\n--- 壳日志 ---")
 try:

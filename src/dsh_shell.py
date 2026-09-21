@@ -94,6 +94,58 @@ CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 # --------------------------------------------------------------------------- #
+# 防睡眠（保持系统唤醒）
+# --------------------------------------------------------------------------- #
+# 用 Windows 的 SetThreadExecutionState 阻止系统进入睡眠：
+#   ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x00000001)
+# 只阻止睡眠，不阻止息屏（不带 ES_DISPLAY_REQUIRED），也不影响锁屏。
+# 进程退出时系统会自动清除该标志，但显式释放更干净（重启/更新流程会复用）。
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+_AWAKE_STATE = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+_awake_held = False
+_awake_lock = threading.Lock()
+
+
+def keep_system_awake():
+    """阻止系统睡眠（不阻止息屏/锁屏）。重复调用幂等。"""
+    global _awake_held
+    with _awake_lock:
+        if _awake_held:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            prev = kernel32.SetThreadExecutionState(_AWAKE_STATE)
+            if prev == 0:
+                log("设置防睡眠失败（SetThreadExecutionState 返回 0）")
+                return
+            _awake_held = True
+            log("已阻止系统睡眠（息屏/锁屏不受影响）")
+        except Exception as exc:  # noqa: BLE001
+            log("设置防睡眠异常: %s" % exc)
+
+
+def release_system_awake():
+    """释放防睡眠标志，恢复系统默认睡眠策略。重复调用幂等。"""
+    global _awake_held
+    with _awake_lock:
+        if not _awake_held:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            _awake_held = False
+            log("已释放防睡眠，恢复系统默认睡眠策略")
+        except Exception as exc:  # noqa: BLE001
+            log("释放防睡眠异常: %s" % exc)
+
+
+# --------------------------------------------------------------------------- #
 # 路径
 # --------------------------------------------------------------------------- #
 
@@ -2503,7 +2555,7 @@ class DshShellApp(object):
         threading.Thread(target=self._shutdown, daemon=True).start()
 
     def _shutdown(self):
-        """退出收尾：停安装/服务 -> 销毁窗口 -> 强杀进程。"""
+        """退出收尾：停安装/服务 -> 释放防睡眠 -> 销毁窗口 -> 强杀进程。"""
         try:
             # 首次安装还在跑的话，先把 npm 进程树杀掉，别留 node 在后台下载
             self.service.stop_npm_install()
@@ -2514,6 +2566,10 @@ class DshShellApp(object):
         except Exception as exc:  # noqa: BLE001
             log("退出时停止服务失败: %s" % exc)
         mark("服务已停")
+        # 程序要退出了，恢复系统默认睡眠策略（进程退出时系统也会自动清除，
+        # 但显式释放更干净，也覆盖重启/更新等复用流程）。
+        release_system_awake()
+        mark("防睡眠已释放")
         for name in ("window", "manager_window"):
             window = getattr(self, name)
             if window is None:
@@ -2891,6 +2947,10 @@ def main():
         log("已有实例在运行，本次启动退出")
         return
     mark("单实例锁就绪")
+
+    # 启动即阻止系统睡眠（不阻止息屏/锁屏），退出时在 _shutdown 里释放。
+    keep_system_awake()
+    mark("防睡眠已设置")
 
     try:
         if not os.path.isfile(ICON_PATH):
