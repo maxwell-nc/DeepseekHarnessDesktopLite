@@ -2359,6 +2359,33 @@ class DshShellApp(object):
 
     # ---------------- 托盘动作 ---------------- #
 
+    def action_restart(self, *_args):
+        """托盘「重启服务」：只重启本地 dsh 服务进程（反代），应用本体不动。
+
+        stop -> start -> wait_ready，完成后重新加载当前页面（token 会变）。
+        应用进程、托盘、窗口都保持原样。
+        """
+        if not self.busy.acquire(blocking=False):
+            self.notify("已有任务在执行，请稍候")
+            return
+        try:
+            self.set_status("正在重启服务…", "stop -> start")
+            self.service.stop()
+            self.service.start()
+            if not self.service.wait_ready(poll_log=self.set_tail):
+                self.set_status("重启后服务未就绪", self.service.read_service_tail(), "err")
+                self.notify("服务重启失败，请查看日志")
+                return
+            self.set_status("服务已重启", "dsh %s" % (self.service.installed_version() or "?"), "done")
+            self.load_url()
+            self.notify("本地服务已重启")
+        except Exception as exc:  # noqa: BLE001
+            log("重启异常: %s\n%s" % (exc, traceback.format_exc()))
+            self.set_status("重启失败", str(exc), "err")
+            self.notify("重启失败：%s" % exc)
+        finally:
+            self.busy.release()
+
     def action_restart_app(self, *_args):
         """托盘「重启应用」：先拉起一个新实例，再退出当前实例。
 
@@ -2493,6 +2520,7 @@ class DshShellApp(object):
             pystray.MenuItem("在浏览器中打开", self.open_in_browser),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._version_label, None, enabled=False),
+            pystray.MenuItem("重启服务", self.action_restart),
             pystray.MenuItem("重启应用", self.action_restart_app),
             pystray.MenuItem(self._update_label, self.action_update),
             pystray.MenuItem(self._registry_label, self.action_toggle_registry),
