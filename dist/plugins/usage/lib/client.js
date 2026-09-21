@@ -404,11 +404,17 @@ window.__ModuleLoader__.load({
 			const triggerRef = react.useRef(null);
 			const controllerRef = react.useRef(null);
 
-			const load = react.useCallback(() => {
+			/**
+			 * 拉一次数据。`silent` 为 true 时是后台轮询（徽标 / 面板共用），
+			 * 不把 phase 拨到「读取中…」，免得刷新按钮每 5 秒闪一下。
+			 */
+			const load = react.useCallback((silent) => {
 				controllerRef.current?.abort();
 				const controller = new AbortController();
 				controllerRef.current = controller;
-				setState((previous) => ({ ...previous, phase: previous.data ? "refreshing" : "loading" }));
+				if (!silent) {
+					setState((previous) => ({ ...previous, phase: previous.data ? "refreshing" : "loading" }));
+				}
 				fetch(API_PATH, { signal: controller.signal, cache: "no-store" })
 					.then((response) => {
 						if (!response.ok) throw new Error("HTTP " + response.status);
@@ -427,25 +433,27 @@ window.__ModuleLoader__.load({
 					});
 			}, []);
 
-			// 入口上顺手显示今天的用量，所以挂载就读一次
+			// 挂载后立即读一次，然后每 5 秒轮询一次 —— 左下角徽标（今天的用量）
+			// 和面板共用这份数据，所以轮询不只在面板打开时跑，关着也持续刷新
 			react.useEffect(() => {
-				load();
-				return () => controllerRef.current?.abort();
+				load(true);
+				const timer = window.setInterval(() => load(true), POLL_MS);
+				return () => {
+					window.clearInterval(timer);
+					controllerRef.current?.abort();
+				};
 			}, [load]);
 
-			// 打开时才轮询，关掉就停
+			// 面板打开时：先立刻刷一次，再继续上面的 5 秒轮询；关掉就停
 			react.useEffect(() => {
 				if (!open) return undefined;
-				load();
-				const timer = window.setInterval(load, POLL_MS);
+				load(true);
 				const onKey = (event) => {
 					if (event.key === "Escape") setOpen(false);
 				};
 				document.addEventListener("keydown", onKey);
 				return () => {
-					window.clearInterval(timer);
 					document.removeEventListener("keydown", onKey);
-					controllerRef.current?.abort();
 				};
 			}, [open, load]);
 
