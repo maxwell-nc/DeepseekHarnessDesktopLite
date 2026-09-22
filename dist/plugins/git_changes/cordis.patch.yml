@@ -1,0 +1,10 @@
+# dsh profile 补丁片段 —— 把本插件 host 半边插进 profile 的插件树。
+#
+# 本片段是一个 YAML 列表，不要写 YAML 文档头。
+# `insert` 不带 `id` 时新条目直接追加到根条目列表；`name` 是相对 profile 目录的路径。
+#
+# 浏览器半边（lib/client.js）不需要在这里声明：dsh 的 client-modules 会按包清单里的
+# `dsh.client` 字段自动发现它 —— 见同目录 package.json 的 exports["./client"]。
+- insert:
+    - id: dsh-git-changes
+      name: ./plugins/git_changes/git_changes.mjs

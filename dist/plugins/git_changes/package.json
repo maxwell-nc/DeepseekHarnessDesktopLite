@@ -1,0 +1,17 @@
+{
+  "name": "dsh-git-changes",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh Git 变更查看插件（host 半边 + Web 客户端半边）",
+  "exports": {
+    ".": "./git_changes.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

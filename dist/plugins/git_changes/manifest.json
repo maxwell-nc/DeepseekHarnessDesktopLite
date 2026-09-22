@@ -1,0 +1,10 @@
+{
+  "id": "git_changes",
+  "name": "Git 变更查看",
+  "description": "绑定当前对话的仓库，查看 git 本地变更（含未跟踪文件）与提交日志（所有分支，最多 200 条）。本地变更支持查看差异、复制代码、单个/批量回滚（需确认）；日志只读，可查看每次提交改动的文件与内容。对比布局参考 review 插件：电脑上左右对照、手机上上下堆叠，均带行号。",
+  "version": "1.0.0",
+  "order": 40,
+  "entry": "git_changes.mjs",
+  "patch": "cordis.patch.yml",
+  "requiresRestart": true
+}
