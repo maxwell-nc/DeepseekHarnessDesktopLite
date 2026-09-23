@@ -3123,19 +3123,6 @@ VERSION_MANAGER_HTML = """<!doctype html>
   }
   .paths select:hover { border-color: rgba(22, 32, 58, .26); }
   .hbtns { display: flex; gap: 8px; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; max-width: 46%; }
-  .quota {
-    display: none; align-items: center; gap: 10px;
-    margin: 12px 18px 0; padding: 9px 13px;
-    background: rgba(255, 244, 214, .7); border: 1px solid rgba(166, 102, 0, .38);
-    border-radius: 10px; color: #8a5a00; font-size: 12px; line-height: 1.6;
-  }
-  .quota.show { display: flex; }
-  .quota button {
-    margin-left: auto; flex: 0 0 auto;
-    background: #fff; color: #8a5a00; border: 1px solid rgba(166, 102, 0, .45);
-    border-radius: 8px; padding: 5px 12px; font-size: 12px; cursor: pointer;
-  }
-  .quota button:hover { background: #fff8e8; }
   main { flex: 1; overflow-y: auto; padding: 12px 18px 16px; }
   .bk-title {
     display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
@@ -3252,7 +3239,7 @@ VERSION_MANAGER_HTML = """<!doctype html>
         活动槽位 <b id="p-slots">…</b><br>
         配置目录 <b id="p-home">…</b><br>
         npm 源 <select id="p-registry" title="下载 / 检查更新走哪个源；托盘不再提供换源入口"></select>
-        ｜已下载 <b id="p-count">…</b>｜共占用 <b id="p-size">…</b>
+        ｜已下载 <b id="p-count">…</b>
       </div>
     </div>
     <div class="hbtns">
@@ -3262,11 +3249,6 @@ VERSION_MANAGER_HTML = """<!doctype html>
       <button class="ghost" id="btn-slots-dir">打开槽位目录</button>
     </div>
   </header>
-
-  <div class="quota" id="quota">
-    <span id="quota-text">…</span>
-    <button id="btn-clean">去清理</button>
-  </div>
 
   <main>
     <div id="list"><div class="empty">正在读取…</div></div>
@@ -3365,13 +3347,12 @@ VERSION_MANAGER_HTML = """<!doctype html>
 
     var chips = channelChip(row);
     if (row.active) chips += '<span class="chip on-now">当前使用</span>';
-    if (row.installed && !row.active) chips += '<span class="chip have">已下载 ' + fmtMB(row.sizeMB) + '</span>';
+    if (row.installed && !row.active) chips += '<span class="chip have">已下载</span>';
     if (!row.installed) chips += '<span class="chip">未下载</span>';
     if (row.source === 'local-only') chips += '<span class="chip">仅本机</span>';
 
     var sub = [];
     if (row.publishedAt) sub.push('发布于 ' + fmtDate(row.publishedAt));
-    if (row.installed && row.sizeMB != null) sub.push(fmtMB(row.sizeMB));
 
     var acts = '';
     if (downloading) {
@@ -3459,22 +3440,10 @@ VERSION_MANAGER_HTML = """<!doctype html>
     document.getElementById('p-home').textContent = state.homeDir || '(未安装)';
     fillRegistry(state);
     document.getElementById('p-count').textContent = state.slotCount + ' 个（上限 ' + state.maxSlots + '）';
-    document.getElementById('p-size').textContent = fmtMB(state.totalSizeMB) || '0 MB';
 
     // 版本 -> 配置目录（行里的「配置目录」按钮靠它判断在不在）
     homeDirs = {};
     (state.homes || []).forEach(function (h) { homeDirs[h.version] = h.dir; });
-
-    // 超限：只提示（非弹窗），带跳转按钮方便清理
-    var quota = document.getElementById('quota');
-    if (state.slotCount > state.maxSlots) {
-      document.getElementById('quota-text').textContent =
-        '已下载 ' + state.slotCount + ' 个版本（上限 ' + state.maxSlots + '），共占用 '
-        + fmtMB(state.totalSizeMB) + '，建议清理不再需要的版本 —— 每个版本约 220 MB。';
-      quota.classList.add('show');
-    } else {
-      quota.classList.remove('show');
-    }
 
     var list = document.getElementById('list');
     if (!state.versions || state.versions.length === 0) {
@@ -3500,7 +3469,6 @@ VERSION_MANAGER_HTML = """<!doctype html>
     if (hint) {
       hint.textContent = '切换前会自动备份；自动 / 手动两个池子各留最近 '
         + (state.backupRetention || 10) + ' 份'
-        + (state.backupSizeMB ? '，共占 ' + fmtMB(state.backupSizeMB) : '')
         + '（存 backups 下，删配置前先想清楚）';
     }
     var bkList = document.getElementById('bk-list');
@@ -3704,7 +3672,6 @@ VERSION_MANAGER_HTML = """<!doctype html>
         setStatus('npm 源已切换：' + res.registry + '，之后的下载/检查更新都走它', 'ok');
       }).catch(function (error) { setStatus('换源失败：' + error, 'err'); });
     });
-    document.getElementById('btn-clean').addEventListener('click', function () { api.open_slots_dir(); });
     document.getElementById('dlg-cancel').addEventListener('click', closeDialog);
     document.getElementById('dlg-ok').addEventListener('click', confirmDialog);
   }
@@ -3933,7 +3900,6 @@ class DshShellApp(object):
                     "publishedAt": item.get("publishedAt") or "",
                     "installed": slot is not None,
                     "active": ver == active,
-                    "sizeMB": slot_size_mb(slot["dir"]) if slot else None,
                     "source": "remote",
                 }
             )
@@ -3951,14 +3917,10 @@ class DshShellApp(object):
                     "publishedAt": "",
                     "installed": True,
                     "active": ver == active,
-                    "sizeMB": slot_size_mb(slot["dir"]),
                     "source": "local-only",
                 }
             )
 
-        total = 0
-        for slot in slots:
-            total += slot_size_mb(slot["dir"])
         backups = list_backups()
         return {
             "versions": rows,
@@ -3970,7 +3932,6 @@ class DshShellApp(object):
             "checking": self.vm_checking,
             "slotCount": len(slots),
             "maxSlots": max_slots(),
-            "totalSizeMB": total,
             "registry": registry_label(effective_registry()),
             "registryUrl": effective_registry(),
             # 下拉框的数据源（托盘已不提供换源入口，换源只在这里）
@@ -3987,13 +3948,11 @@ class DshShellApp(object):
                 {
                     "version": item["version"],
                     "dir": item["dir"],
-                    "sizeMB": slot_size_mb(item["dir"]),
                     "active": item["version"] == active,
                 }
                 for item in list_local_homes()
             ],
             "backups": backups,
-            "backupSizeMB": sum(item["sizeMB"] for item in backups),
             "backupRetention": BACKUP_RETENTION,
             "task": self._vm_task_state(),
             "status": self.vm_status,
@@ -4259,6 +4218,9 @@ class DshShellApp(object):
             return {"ok": False, "error": "删除失败（可能有文件被占用）：%s" % exc}
         finally:
             self.busy.release()
+            # 删除后槽位占用变了：清掉缓存，避免下次打开版本管理器时
+            # 用旧大小（虽然状态快照已不再算占用，删除动作仍会读一次）。
+            _slot_size_cache.pop(path, None)
 
     def vm_open_slots_dir(self):
         try:

@@ -231,7 +231,7 @@ def main():
             check("状态行读到了 Python 侧文本", "自测" in (state.get("status") or ""),
                   state.get("status", ""))
 
-            # 2) DOM：头部信息 / 按钮 / 超限提示条 / 确认框 / 重启遮罩
+            # 2) DOM：头部信息 / 按钮 / 确认框 / 重启遮罩
             dom = manager.evaluate_js(
                 "JSON.stringify({"
                 "btnRefresh: !!document.getElementById('btn-refresh'),"
@@ -243,8 +243,6 @@ def main():
                 "bkRows: document.querySelectorAll('#bk-list .row').length,"
                 "bkHint: (document.getElementById('bk-hint')||{}).textContent||'',"
                 "bkEmpty: !!document.querySelector('#bk-list .empty'),"
-                "quotaShown: document.getElementById('quota').classList.contains('show'),"
-                "quotaBtn: !!document.getElementById('btn-clean'),"
                 "maskShown: document.getElementById('mask').classList.contains('show'),"
                 "restartShown: document.getElementById('restarting').classList.contains('show'),"
                 "rows: document.querySelectorAll('#list .row').length,"
@@ -274,9 +272,6 @@ def main():
                   str(info.get("bkHint")))
             check("默认不弹确认框（mask 隐藏）", not info.get("maskShown"), str(info))
             check("默认没有重启遮罩", not info.get("restartShown"), str(info))
-            check("已下载数没超限时提示条隐藏",
-                  bool(info.get("quotaShown")) == (state.get("slotCount", 0) > state.get("maxSlots", 10**9)),
-                  str(info))
             check("当前版本写进了头部", bool(info.get("installed")), str(info))
 
             # 3) 切换确认框：**所有切换都必须先过它**（窗口内，不是系统弹窗）
