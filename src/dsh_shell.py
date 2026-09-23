@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ import urllib.error
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 from collections import deque
 
 # 源码旁边的 __pycache__ 是噪音，统一丢到 <项目根>/build/pycache 下。
@@ -58,6 +60,10 @@ URL = "http://%s:%d" % (HOST, PORT)
 MUTEX_NAME = "Local\\DeepSeekHarnessDesktopShell"
 # 重启应用时，新实例在单实例锁上轮询等待旧实例退出释放锁的最长时间。
 RESTART_LOCK_TIMEOUT = 30.0
+# 版本切换时，新实例带着这个环境变量启动：拿到单实例锁（旧实例已完全退出、
+# WebView2 进程已释放文件）后，先删掉整个 webview 配置目录再启动，避免跨版本
+# 残留的 localStorage / 缓存 / cookie（同一 origin 共用）把新版本前端带崩。
+CLEAR_WEBVIEW_ENV = "DSH_UI_CLEAR_WEBVIEW"
 
 # 窗口底色：亮色主题，和 HTML 里的 --bg 保持一致（WebView2 首帧还没渲染时的底色）
 WINDOW_BG = "#f4f6fb"
@@ -972,10 +978,589 @@ def cleanup_partial_slots():
         if not slot["partial"]:
             continue
         try:
-            shutil.rmtree(slot["dir"])
+            _rmtree(slot["dir"])
             log("已清理下载残留: %s" % slot["dir"])
         except OSError as exc:
             log("清理下载残留失败 %s: %s" % (slot["dir"], exc))
+
+
+# --------------------------------------------------------------------------- #
+# 配置目录：**每个版本一份独立的 dsh home**（等价于原来的 ~/.dsh）
+#
+#     homes/<版本>/           credentials / settings / sessions / storages /
+#                             attachments / profiles/…
+#     backups/auto|manual/    切换版本前自动备份 / 版本管理器里手动备份，
+#                             两个池子各自滚动保留 BACKUP_RETENTION 份
+#
+# 第一次给某个版本建目录时，从「切换前正在用的那份 home」拷一个副本过去：
+# 源 = 其它版本 home 里 mtime 最新的那个 -> 老 ~/.dsh -> 空目录（再由外壳按
+# dsh 的 shipped 模板补一个 profiles/web 骨架）。**已存在的目录一个字节不动。**
+#
+# 复制 / 打包一律**跳过 reparse point**（junction / symlink）：profiles/node_modules
+# 是 dsh 每次启动按活动槽位重建的 400+ 条 junction，跟着拷会把旧槽位 220 MB 真
+# 文件拖进来；拷成真目录 dsh 还会拒绝启动（heal 的 ensureSymlink 抛 "exists and
+# is not a symlink or dsh-managed module proxy"）。这些链接由 dsh 自己在下次启动
+# 时按当前活动槽位重建，所以跳过它们是安全的。
+# --------------------------------------------------------------------------- #
+
+HOMES_ROOT = os.path.join(DATA_DIR, "homes")
+BACKUPS_ROOT = os.path.join(DATA_DIR, "backups")
+BACKUP_RETENTION = 10                # auto / manual 两个池子各自保留的份数
+LEGACY_DSH_HOME = os.path.join(os.path.expanduser("~"), ".dsh")
+# Windows：junction / symlink / mount point 都带 FILE_ATTRIBUTE_REPARSE_POINT
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+# 备份文件名：<版本>__<YYYYmmdd-HHMMSS>[-n].zip（版本里可能有下划线，所以用正则拆）
+BACKUP_NAME_RE = re.compile(r"^(?P<ver>.+)__(?P<ts>\d{8}-\d{6}(?:-\d+)?)\.zip$")
+# 恢复时的临时目录后缀（这些目录不算 home，也必须在扫描时跳过）
+PARTIAL_HOME_SUFFIXES = (".restoring", ".old", ".part")
+
+# profiles/web 的 shipped 模板 —— 照抄 dsh 的 PROFILE_TEMPLATES.web + initProfile。
+# 只在「全新配置目录、dsh 还没起过」时由外壳补骨架，dsh 启动时的
+# normalizeShippedProfile 会在元组不对时把它纠正成自己那版。
+PROFILE_TEMPLATE_MANIFEST = {
+    "name": "dsh-profile-web",
+    "private": True,
+    "dependencies": {},
+    "dsh": {
+        "profile": {
+            "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"],
+            "patchReload": "live",
+        }
+    },
+}
+PROFILE_ROOT_CONFIG = (
+    "# dsh profile root — an empty entry list. The tree is composed as patches:\n"
+    "# each bundle in package.json's dsh.profile.bundles, then cordis.patch.yml, then any\n"
+    "# --patch overlays. Edit cordis.patch.yml, not this file.\n"
+    "[]\n"
+)
+PROFILE_PATCH_TEMPLATE = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+    "[]\n"
+)
+PROFILE_PNPM_WORKSPACE = (
+    "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n"
+)
+
+
+def _is_reparse(path):
+    """是不是 reparse point（junction / symlink / mount point）。"""
+    try:
+        return bool(os.lstat(path).st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
+        return False
+
+
+def _rmtree(path):
+    """删目录树：**先清掉只读位再删**（Windows 上只读文件 unlink 会 EACCES）。
+
+    dsh 的 attachments 内容寻址对象就是只读的（0o444），恢复配置要换名删老目录
+    时必然撞上 —— 裸 shutil.rmtree 会在那里抛 PermissionError 并留下半截残目录。
+    """
+
+    def clear_readonly(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        func(target)                      # 还删不掉就照常抛给调用方
+
+    shutil.rmtree(path, onerror=clear_readonly)
+
+
+def _force_remove(path):
+    """删文件 / 目录 / **链接**，只读的先解锁（返回有没有删掉）。
+
+    顺序很要紧：先判 reparse point —— 对 junction 做 chmod 会跟着改到**目标目录**
+    的权限（那可能是整个槽位），所以链接一律只 `rmdir` 摘掉，绝不碰目标。
+    """
+    if not os.path.lexists(path):
+        return False
+    if _is_reparse(path):
+        os.rmdir(path)                    # junction / symlink：只摘链接
+        return True
+    if os.path.isdir(path):
+        _rmtree(path)
+        return True
+    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)   # 只读文件 unlock
+    os.remove(path)
+    return True
+
+
+def _skip_reparse(src, names):
+    """shutil.copytree 的 ignore 回调：**丢掉** reparse point（不跟随、不复制）。"""
+    return {name for name in names if _is_reparse(os.path.join(src, name))}
+
+
+def home_dir_for(version):
+    """某版本的配置目录（不存在也返回路径）。"""
+    ver = sanitize_version(version)
+    if not ver:
+        raise ValueError("非法版本号: %r" % (version,))
+    return os.path.join(HOMES_ROOT, ver)
+
+
+def _explicit_home_override():
+    """显式**固定**的 dsh home（config.dshHome），没写返回 None。
+
+    只认配置、**不认环境变量**：dsh 自己的会话会把 ``DSH_HOME=~/.dsh`` 带进
+    子进程环境（从 dsh 终端里启动本程序就会撞上），拿它当开关会让「每版本独立
+    配置目录」在毫无提示的情况下失效。外壳算出来的结果一律由 _child_env()
+    注入子进程，所以忽略环境变量不会造成两边各说各话。
+    """
+    value = (load_config().get("dshHome") or "").strip()
+    return os.path.abspath(os.path.expanduser(value)) if value else None
+
+
+def _home_for_version(version=None):
+    """某个版本**实际在用**的配置目录：显式固定时是固定值，否则 homes/<版本>。"""
+    override = _explicit_home_override()
+    if override:
+        return override
+    ver = sanitize_version(version) or active_slot_version()
+    if ver:
+        return home_dir_for(ver)
+    return LEGACY_DSH_HOME
+
+
+def dsh_home():
+    """dsh 配置根 —— 外壳与服务子进程共用的**唯一事实源**。
+
+    优先级：config.dshHome（显式固定，不版本化）> ``homes/<活动版本>``
+    > 老 ``~/.dsh``（还没装出任何版本时）。
+
+    服务子进程那边由 _child_env() 把这个结果注入 ``DSH_HOME``，保证插件同步、
+    信息面板和服务读的是同一份配置。
+    """
+    return _home_for_version()
+
+
+def list_local_homes():
+    """扫描 homes/，返回 [{version, dir, mtime}]，按 mtime 降序（最新用过的在前）。"""
+    out = []
+    if not os.path.isdir(HOMES_ROOT):
+        return out
+    try:
+        names = os.listdir(HOMES_ROOT)
+    except OSError:
+        return out
+    for name in names:
+        if name.endswith(PARTIAL_HOME_SUFFIXES) or name.startswith("."):
+            continue
+        ver = sanitize_version(name)
+        if not ver:
+            continue
+        path = os.path.join(HOMES_ROOT, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        out.append({"version": ver, "dir": path, "mtime": mtime})
+    out.sort(key=lambda item: item["mtime"], reverse=True)
+    return out
+
+
+def _seed_home_source(exclude_version):
+    """给 exclude_version 找种子目录：其它版本 home（最新用过的优先）-> 老 ~/.dsh。"""
+    for item in list_local_homes():
+        if item["version"] != exclude_version:
+            return item["dir"]
+    if os.path.isdir(LEGACY_DSH_HOME):
+        return LEGACY_DSH_HOME
+    return None
+
+
+def _init_profile_skeleton(profile_dir):
+    """按 dsh 的 shipped 模板补 ``profiles/web`` 骨架（**缺才写，绝不覆盖**）。
+
+    只在全新配置目录 / 恢复后需要：不补的话插件同步会因为 profile 目录不存在
+    而被 sync_plugins 的既有兜底跳过一次启动。
+    """
+    try:
+        os.makedirs(profile_dir, exist_ok=True)
+    except OSError as exc:
+        log("创建 profile 目录失败 %s: %s" % (profile_dir, exc))
+        return False
+    wrote = False
+    files = (
+        ("package.json", json.dumps(PROFILE_TEMPLATE_MANIFEST, indent=2, ensure_ascii=False) + "\n"),
+        ("cordis.yml", PROFILE_ROOT_CONFIG),
+        ("cordis.patch.yml", PROFILE_PATCH_TEMPLATE),
+        ("pnpm-workspace.yaml", PROFILE_PNPM_WORKSPACE),
+    )
+    for name, text in files:
+        path = os.path.join(profile_dir, name)
+        if os.path.exists(path):
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            wrote = True
+        except OSError as exc:
+            log("写 %s 失败: %s" % (path, exc))
+    if wrote:
+        log("已补 profile 骨架: %s" % profile_dir)
+    return wrote
+
+
+def ensure_version_home(version=None, note=None):
+    """保证某个版本的配置目录在；缺了就从「切换前那份 home」拷副本过去。
+
+    **已存在的目录一个字节不动。** 任何失败都不抛，只记日志 —— 配置目录准备
+    失败不该挡住服务启动（dsh 自己会按默认目录跑）。
+
+    返回 {"dir": str, "created": bool, "source": str|None}。
+    """
+
+    def say(text):
+        log("[home] %s" % text)
+        if note is not None:
+            try:
+                note(text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    ver = sanitize_version(version) or active_slot_version()
+    if not ver:
+        return {"dir": dsh_home(), "created": False, "source": None}
+    override = _explicit_home_override()
+    if override:
+        # 显式指定的 home 不版本化：目录归用户自己管，外壳只补缺失的 profile 骨架
+        if not os.path.isdir(os.path.join(override, "profiles", PLUGIN_PROFILE)):
+            _init_profile_skeleton(os.path.join(override, "profiles", PLUGIN_PROFILE))
+        return {"dir": override, "created": False, "source": None}
+    dest = home_dir_for(ver)
+    created = False
+    source = None
+    if not os.path.isdir(dest):
+        source = _seed_home_source(ver)
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as exc:
+            say("创建配置目录失败 %s: %s" % (dest, exc))
+            return {"dir": dest, "created": False, "source": None}
+        if source:
+            try:
+                # ignore 会丢掉 junction：dsh 下次启动自己按活动槽位重建
+                shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_skip_reparse)
+            except Exception as exc:  # noqa: BLE001
+                say("复制配置目录失败（按全新目录继续）%s -> %s: %s" % (source, dest, exc))
+                source = None
+            else:
+                say("配置目录 %s 已从 %s 复制" % (dest, source))
+        else:
+            say("全新配置目录: %s" % dest)
+        created = True
+    # 骨架函数只写**缺失**的文件，所以这里总是调：种子目录里的 profile 是空壳时
+    # （只拷到目录、没拷到文件）也能补齐，插件同步就不会被「找不到 profile」挡住。
+    _init_profile_skeleton(os.path.join(dest, "profiles", PLUGIN_PROFILE))
+    return {"dir": dest, "created": created, "source": source}
+
+
+def cleanup_partial_homes():
+    """清掉恢复过程中留下的 *.restoring / *.old / *.part 残留（启动早期调）。"""
+    if not os.path.isdir(HOMES_ROOT):
+        return
+    try:
+        names = os.listdir(HOMES_ROOT)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(PARTIAL_HOME_SUFFIXES):
+            continue
+        path = os.path.join(HOMES_ROOT, name)
+        try:
+            _force_remove(path)
+            log("已清理配置目录残留: %s" % path)
+        except OSError as exc:
+            log("清理配置目录残留失败 %s: %s" % (path, exc))
+
+
+# ----------------------------- 配置备份 ----------------------------- #
+
+
+def _backup_pool(kind):
+    """备份池目录；kind 只能是 auto（切换前自动）或 manual（窗口里手动）。"""
+    if kind not in ("auto", "manual"):
+        raise ValueError("未知备份池: %r" % (kind,))
+    return os.path.join(BACKUPS_ROOT, kind)
+
+
+def _zip_directory(src_dir, dest_zip):
+    """把目录打成 zip（跳过 reparse point），先写 .part 再原子换名。返回文件数。
+
+    不跟随 junction 的意义：备份里不该有指向某个槽位的链接，恢复时也没有
+    链接语义可言（链接由 dsh 按当时的活动槽位重建）。
+    """
+    tmp = dest_zip + ".part"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    count = 0
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for base, dirs, names in os.walk(src_dir):
+            dirs[:] = [name for name in dirs if not _is_reparse(os.path.join(base, name))]
+            for name in names:
+                path = os.path.join(base, name)
+                if _is_reparse(path):
+                    continue
+                zf.write(path, os.path.relpath(path, src_dir))
+                count += 1
+    os.replace(tmp, dest_zip)
+    return count
+
+
+def prune_backups(kind):
+    """池子里只留最近 BACKUP_RETENTION 份，返回被删掉的名字。"""
+    pool = _backup_pool(kind)
+    if not os.path.isdir(pool):
+        return []
+    entries = []
+    try:
+        names = os.listdir(pool)
+    except OSError:
+        return []
+    for name in names:
+        if not BACKUP_NAME_RE.match(name):
+            continue
+        path = os.path.join(pool, name)
+        try:
+            entries.append((os.path.getmtime(path), path))
+        except OSError:
+            pass
+    entries.sort(reverse=True)          # 新的在前
+    removed = []
+    for _mtime, path in entries[BACKUP_RETENTION:]:
+        try:
+            os.remove(path)
+            removed.append(os.path.basename(path))
+        except OSError as exc:
+            log("淘汰旧备份失败 %s: %s" % (path, exc))
+    if removed:
+        log("备份池 %s 淘汰旧备份: %s" % (kind, "、".join(removed)))
+    return removed
+
+
+def backup_home(version=None, kind="auto", note=None):
+    """把某版本的配置目录打成 zip 放进 backups/<kind>/，并按池子淘汰旧的。
+
+    返回 {ok, name, path, version, sizeMB, kind, pruned} / {ok: False, error}。
+    """
+
+    def say(text):
+        log("[backup] %s" % text)
+        if note is not None:
+            try:
+                note(text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    ver = sanitize_version(version) or active_slot_version()
+    if not ver:
+        return {"ok": False, "error": "还没有活动版本，没有可备份的配置"}
+    src = _home_for_version(ver)
+    if not os.path.isdir(src):
+        return {"ok": False, "error": "配置目录不存在：%s" % src}
+    try:
+        pool = _backup_pool(kind)
+        os.makedirs(pool, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": "建不了备份目录：%s" % exc}
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    name = "%s__%s.zip" % (ver, stamp)
+    path = os.path.join(pool, name)
+    index = 1
+    while os.path.exists(path):         # 同一秒里点了两次
+        index += 1
+        name = "%s__%s-%d.zip" % (ver, stamp, index)
+        path = os.path.join(pool, name)
+    say("正在备份配置 %s（%s）…" % (ver, kind))
+    try:
+        files = _zip_directory(src, path)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        log("配置备份失败 %s: %s" % (src, exc))
+        return {"ok": False, "error": "备份失败：%s" % exc}
+    try:
+        size_mb = int(round(os.path.getsize(path) / 1048576.0))
+    except OSError:
+        size_mb = 0
+    removed = prune_backups(kind)
+    say("配置备份完成：%s（%d 个文件，%d MB）" % (name, files, size_mb))
+    return {
+        "ok": True, "name": name, "path": path, "version": ver,
+        "sizeMB": size_mb, "kind": kind, "pruned": removed,
+    }
+
+
+def list_backups():
+    """全部备份，按时间倒序：[{name, kind, version, at, sizeMB}]。"""
+    out = []
+    for kind in ("auto", "manual"):
+        pool = _backup_pool(kind)
+        if not os.path.isdir(pool):
+            continue
+        try:
+            names = os.listdir(pool)
+        except OSError:
+            continue
+        for name in names:
+            match = BACKUP_NAME_RE.match(name)
+            if not match:
+                continue
+            path = os.path.join(pool, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            out.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "version": match.group("ver"),
+                    "at": int(stat.st_mtime * 1000),
+                    "sizeMB": int(round(stat.st_size / 1048576.0)),
+                }
+            )
+    out.sort(key=lambda item: item["at"], reverse=True)
+    return out
+
+
+def _backup_path(name):
+    """备份名 -> 绝对路径；必须落在 auto / manual 两个池子里且真实存在。
+
+    返回 (path, kind)；不合法或找不到抛 ValueError（调用方转成 {"ok": False}）。
+    """
+    name = str(name or "")
+    if not BACKUP_NAME_RE.match(name):
+        raise ValueError("非法备份名：%r" % (name,))
+    for kind in ("auto", "manual"):
+        pool = _backup_pool(kind)
+        path = os.path.join(pool, name)
+        if os.path.isfile(path):
+            return path, kind
+    raise ValueError("找不到备份：%s" % name)
+
+
+def delete_backup(name):
+    """删掉一份备份（校验名字必须落在备份池里，防路径穿越）。"""
+    try:
+        path, kind = _backup_path(name)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return {"ok": False, "error": "删除失败：%s" % exc}
+    log("已删除配置备份: %s" % name)
+    return {"ok": True, "name": name, "kind": kind}
+
+
+def version_from_backup_name(name):
+    """备份名里的版本号；读不出来返回 None。"""
+    match = BACKUP_NAME_RE.match(str(name or ""))
+    if not match:
+        return None
+    return sanitize_version(match.group("ver"))
+
+
+def _extract_home_zip(zip_path, dest_dir):
+    """解压配置备份，并把 zip 里记录的权限（比如只读位）还原回去。
+
+    zipfile 默认不恢复文件权限 —— attachments 的内容寻址对象是只读的，
+    解成可写就和 dsh 自己写的不一致了。
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            out = zf.extract(info, dest_dir)
+            mode = (info.external_attr >> 16) & 0o777
+            if mode and os.path.isfile(out):
+                try:
+                    os.chmod(out, mode)
+                except OSError:
+                    pass
+
+
+def restore_backup(name, note=None):
+    """把一份备份解回**它自己的版本目录**。
+
+    顺序：先把现有目录备份一次（auto 池，失败不阻塞）-> 解到 <目录>.restoring
+    -> 老目录退到 <目录>.old -> 新目录顶上 -> 删掉 .old。任何一步失败都会把
+    现有目录恢复原样，**绝不留下半残的配置**。
+
+    返回 {ok, version, dir, replaced} / {ok: False, error}。
+    """
+
+    def say(text):
+        log("[restore] %s" % text)
+        if note is not None:
+            try:
+                note(text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        path, _kind = _backup_path(name)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    ver = version_from_backup_name(name)
+    if not ver:
+        return {"ok": False, "error": "备份名里读不出版本号：%s" % name}
+    target = _home_for_version(ver)
+    existed = os.path.isdir(target)
+    if existed:
+        say("恢复前先备份当前配置（%s）…" % ver)
+        backup_home(ver, kind="auto", note=note)
+    staging = target + ".restoring"
+    old = target + ".old"
+    for stale in (staging, old):
+        if os.path.isdir(stale):
+            _rmtree(stale)
+    try:
+        os.makedirs(staging, exist_ok=True)
+        _extract_home_zip(path, staging)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _rmtree(staging)
+        except OSError:
+            pass
+        log("解压备份失败 %s: %s" % (name, exc))
+        return {"ok": False, "error": "解压失败：%s" % exc}
+    try:
+        if existed:
+            os.rename(target, old)
+        os.rename(staging, target)
+    except OSError as exc:
+        # 回滚：老目录挪回去，新的丢掉
+        if existed and not os.path.isdir(target) and os.path.isdir(old):
+            try:
+                os.rename(old, target)
+            except OSError as back_exc:
+                log("恢复回滚失败（老配置留在 %s）: %s" % (old, back_exc))
+        try:
+            _rmtree(staging)
+        except OSError:
+            pass
+        return {"ok": False, "error": "替换配置目录失败：%s" % exc}
+    if existed:
+        try:
+            _rmtree(old)                     # 只读的 attachments 对象靠 _rmtree 清
+        except OSError as exc:
+            log("老配置目录没删干净（下次启动会清）%s: %s" % (old, exc))
+    profile = os.path.join(target, "profiles", PLUGIN_PROFILE)
+    if not os.path.isdir(profile):
+        _init_profile_skeleton(profile)
+    say("已恢复配置：%s -> %s" % (name, target))
+    return {"ok": True, "version": ver, "dir": target, "replaced": existed}
 
 
 def _channel_of(ver, tags):
@@ -1186,14 +1771,6 @@ def third_party_plugins_dir():
     return os.path.join(os.path.dirname(BASE_DIR), "dist", "plugins-third-party")
 
 
-def dsh_home():
-    """dsh 配置根：config.json 的 dshHome > 环境变量 DSH_HOME > ~/.dsh。"""
-    value = (load_config().get("dshHome") or os.environ.get("DSH_HOME") or "").strip()
-    if value:
-        return os.path.abspath(os.path.expanduser(value))
-    return os.path.join(os.path.expanduser("~"), ".dsh")
-
-
 def plugin_profile_dir():
     return os.path.join(dsh_home(), "profiles", PLUGIN_PROFILE)
 
@@ -1243,13 +1820,13 @@ def _is_link(path):
 
 
 def _remove_tree(path):
-    """删目录：是链接就只摘链接（绝不递归进目标），否则整棵删。"""
+    """删目录：是链接就只摘链接（绝不递归进目标），否则整棵删（容忍只读）。"""
     if not os.path.lexists(path):
         return False
     if _is_link(path):
         os.rmdir(path)
     else:
-        shutil.rmtree(path, onerror=None)
+        _rmtree(path)
     return True
 
 
@@ -1514,6 +2091,13 @@ def sync_plugins(on_note=None):
                 on_note(text)
             except Exception:  # noqa: BLE001
                 pass
+
+    # 每版本配置目录可能还没建（探针 / 直调 sync_plugins 不经过 main()）：
+    # 先保证它在 —— 缺了就从「切换前那份 home」拷副本，还是没有就补 profile 骨架。
+    try:
+        ensure_version_home(note=on_note)
+    except Exception as exc:  # noqa: BLE001
+        note("准备配置目录失败（继续按现状同步）：%s" % exc)
 
     profile_dir = plugin_profile_dir()
     if not os.path.isdir(profile_dir):
@@ -1881,6 +2465,10 @@ class DshService(object):
         env["NO_COLOR"] = "1"
         env["FORCE_COLOR"] = "0"
         env["BROWSER"] = "none"          # 阻止 dsh 自己弹系统浏览器
+        # 配置目录：**每版本一个 home**，由外壳算好注进子进程，保证服务读的
+        # 和外壳（插件同步、信息面板）读的是同一份。不覆盖的话，机器上残留的
+        # 旧 DSH_HOME 会让两边各说各话（config.dshHome 曾经就是这么只给外壳用的）。
+        env["DSH_HOME"] = dsh_home()
         # 插件的运行数据（比如 usage 插件的账本）统一放到本程序的数据根下，
         # 别塞进会被整目录重抄的插件目录里。约定见 PLUGIN_RUNTIME_DIRS。
         env["DSH_UI_DATA_DIR"] = DATA_DIR
@@ -2534,7 +3122,7 @@ VERSION_MANAGER_HTML = """<!doctype html>
     max-width: 220px;
   }
   .paths select:hover { border-color: rgba(22, 32, 58, .26); }
-  .hbtns { display: flex; gap: 8px; flex: 0 0 auto; }
+  .hbtns { display: flex; gap: 8px; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; max-width: 46%; }
   .quota {
     display: none; align-items: center; gap: 10px;
     margin: 12px 18px 0; padding: 9px 13px;
@@ -2549,6 +3137,12 @@ VERSION_MANAGER_HTML = """<!doctype html>
   }
   .quota button:hover { background: #fff8e8; }
   main { flex: 1; overflow-y: auto; padding: 12px 18px 16px; }
+  .bk-title {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    margin: 18px 2px 8px; font-size: 12.5px; font-weight: 600; color: #47506a;
+  }
+  .bk-title .hint { font-weight: 400; font-size: 11px; color: var(--dim); }
+  .bk-title .open { margin-left: auto; }
   .row {
     display: flex; align-items: flex-start; gap: 14px;
     padding: 12px 15px; margin-bottom: 10px;
@@ -2650,12 +3244,15 @@ VERSION_MANAGER_HTML = """<!doctype html>
         当前版本 <b id="p-installed">…</b>
         ｜服务 <b id="p-running">…</b><br>
         活动槽位 <b id="p-slots">…</b><br>
+        配置目录 <b id="p-home">…</b><br>
         npm 源 <select id="p-registry" title="下载 / 检查更新走哪个源；托盘不再提供换源入口"></select>
         ｜已下载 <b id="p-count">…</b>｜共占用 <b id="p-size">…</b>
       </div>
     </div>
     <div class="hbtns">
       <button class="ghost" id="btn-refresh">刷新</button>
+      <button class="ghost" id="btn-backup" title="把当前版本的配置打包存到 backups/manual（最多保留 10 份）">备份配置</button>
+      <button class="ghost" id="btn-home-dir" title="打开当前版本的配置目录（删掉的版本想清配置也从这里进）">打开配置目录</button>
       <button class="ghost" id="btn-slots-dir">打开槽位目录</button>
     </div>
   </header>
@@ -2665,10 +3262,19 @@ VERSION_MANAGER_HTML = """<!doctype html>
     <button id="btn-clean">去清理</button>
   </div>
 
-  <main id="list"><div class="empty">正在读取…</div></main>
+  <main>
+    <div id="list"><div class="empty">正在读取…</div></div>
+
+    <div class="bk-title">
+      <span>配置备份</span>
+      <span class="hint" id="bk-hint">切换版本前会自动备一份；手动备份两个池子各留最近 10 份</span>
+      <button class="ghost open" id="btn-backups-dir">打开备份目录</button>
+    </div>
+    <div id="bk-list"><div class="empty">还没有备份</div></div>
+  </main>
 
   <footer>
-    <span id="status">下载会进独立文件夹，互不覆盖；切换前会先确认，确认后自动重启应用。</span>
+    <span id="status">下载会进独立文件夹，互不覆盖；切换前会先确认，确认后自动重启应用并自动备份旧版本的配置。</span>
   </footer>
 
   <div id="mask">
@@ -2693,7 +3299,10 @@ VERSION_MANAGER_HTML = """<!doctype html>
   var last = null;
   var pendingSwitch = null;      // 确认框里待切换的版本
   var pendingRemove = null;      // 确认框里待删除的版本
+  var pendingRestore = null;     // 确认框里待恢复的备份名
+  var pendingDeleteBk = null;    // 确认框里待删除的备份名
   var restarting = false;
+  var homeDirs = {};             // 版本 -> 配置目录（homes/<版本>）
 
   var CHANNELS = {
     stable: '稳定', alpha: 'alpha', beta: 'beta', rc: 'rc',
@@ -2724,6 +3333,15 @@ VERSION_MANAGER_HTML = """<!doctype html>
     if (mb == null) return '';
     if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
     return mb + ' MB';
+  }
+
+  function fmtTime(ms) {
+    if (!ms) return '';
+    var d = new Date(ms);
+    if (isNaN(d.getTime())) return '';
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+      + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
   }
 
   function channelChip(row) {
@@ -2760,6 +3378,11 @@ VERSION_MANAGER_HTML = """<!doctype html>
         acts += '<button class="ghost danger" data-act="remove" data-ver="' + esc(row.version) + '"' + (busy ? ' disabled' : '') + '>删除</button>';
       }
       acts += '<button class="ghost" data-act="dir" data-ver="' + esc(row.version) + '">打开目录</button>';
+      // 配置目录按版本分开存（homes/<版本>）；删掉槽位它也还在，就靠这个按钮进去清
+      if (homeDirs[row.version]) {
+        acts += '<button class="ghost" data-act="home" data-ver="' + esc(row.version) + '"'
+          + ' title="' + esc(homeDirs[row.version]) + '">配置目录</button>';
+      }
     }
 
     var progress = '';
@@ -2803,14 +3426,38 @@ VERSION_MANAGER_HTML = """<!doctype html>
     if (sel.value !== url) sel.value = url;
   }
 
+  // 备份行：名字 / 来源（自动·切换前 / 手动）/ 版本 / 时间 / 大小 + 恢复·删除
+  function backupRowHtml(bk, state) {
+    var busy = !!state.busy;
+    var chipCls = bk.kind === 'manual' ? 'have' : '';
+    var chipTxt = bk.kind === 'manual' ? '手动' : '切换前自动';
+    return '<div class="row" data-backup="' + esc(bk.name) + '">'
+      + '<div class="meta">'
+      + '<div class="title"><span class="ver">' + esc(bk.name) + '</span>'
+      + '<span class="chip ' + chipCls + '">' + chipTxt + '</span>'
+      + '<span class="chip">' + esc(bk.version) + '</span></div>'
+      + '<div class="sub">' + esc(fmtTime(bk.at)) + ' ｜ ' + fmtMB(bk.sizeMB) + '</div>'
+      + '</div>'
+      + '<div class="acts">'
+      + '<button class="primary" data-act="restore-bk" data-name="' + esc(bk.name) + '"' + (busy ? ' disabled' : '') + '>恢复</button>'
+      + '<button class="ghost danger" data-act="delete-bk" data-name="' + esc(bk.name) + '"' + (busy ? ' disabled' : '') + '>删除</button>'
+      + '</div>'
+      + '</div>';
+  }
+
   function render(state) {
     last = state;
     document.getElementById('p-installed').textContent = state.installedVersion || '未安装';
     document.getElementById('p-running').textContent = state.serviceRunning ? '运行中' : '已停止';
     document.getElementById('p-slots').textContent = state.activeSlotDir || '(未安装)';
+    document.getElementById('p-home').textContent = state.homeDir || '(未安装)';
     fillRegistry(state);
     document.getElementById('p-count').textContent = state.slotCount + ' 个（上限 ' + state.maxSlots + '）';
     document.getElementById('p-size').textContent = fmtMB(state.totalSizeMB) || '0 MB';
+
+    // 版本 -> 配置目录（行里的「配置目录」按钮靠它判断在不在）
+    homeDirs = {};
+    (state.homes || []).forEach(function (h) { homeDirs[h.version] = h.dir; });
 
     // 超限：只提示（非弹窗），带跳转按钮方便清理
     var quota = document.getElementById('quota');
@@ -2832,7 +3479,8 @@ VERSION_MANAGER_HTML = """<!doctype html>
       list.innerHTML = state.versions.map(function (row) { return rowHtml(row, state); }).join('');
       Array.prototype.forEach.call(list.querySelectorAll('button[data-act]'), function (btn) {
         btn.addEventListener('click', function () {
-          onAction(btn.getAttribute('data-act'), btn.getAttribute('data-ver'));
+          onAction(btn.getAttribute('data-act'), btn.getAttribute('data-ver'),
+                   btn.getAttribute('data-name'));
         });
       });
     }
@@ -2841,10 +3489,34 @@ VERSION_MANAGER_HTML = """<!doctype html>
     refreshBtn.disabled = !!state.checking;
     refreshBtn.textContent = state.checking ? '检查中…' : '刷新';
 
+    // ---- 配置备份清单 ----
+    var hint = document.getElementById('bk-hint');
+    if (hint) {
+      hint.textContent = '切换前会自动备份；自动 / 手动两个池子各留最近 '
+        + (state.backupRetention || 10) + ' 份'
+        + (state.backupSizeMB ? '，共占 ' + fmtMB(state.backupSizeMB) : '')
+        + '（存 backups 下，删配置前先想清楚）';
+    }
+    var bkList = document.getElementById('bk-list');
+    if (bkList) {
+      var bks = state.backups || [];
+      if (bks.length === 0) {
+        bkList.innerHTML = '<div class="empty">还没有备份 —— 点右上角「备份配置」手动存一份。</div>';
+      } else {
+        bkList.innerHTML = bks.map(function (bk) { return backupRowHtml(bk, state); }).join('');
+        Array.prototype.forEach.call(bkList.querySelectorAll('button[data-act]'), function (btn) {
+          btn.addEventListener('click', function () {
+            onAction(btn.getAttribute('data-act'), btn.getAttribute('data-ver'),
+                     btn.getAttribute('data-name'));
+          });
+        });
+      }
+    }
+
     var text = state.status || '';
     var kind = state.error ? 'err' : (state.busy ? 'busy' : '');
     if (!text) {
-      text = '下载会进独立文件夹，互不覆盖；切换前会先确认，确认后自动重启应用。';
+      text = '配置按版本分开存（homes/<版本>）；切换前自动备份旧配置，最多各留 10 份。';
     } else if (state.busy) {
       kind = 'busy';
     } else if (!state.error) {
@@ -2858,7 +3530,7 @@ VERSION_MANAGER_HTML = """<!doctype html>
     setStatus(text, kind);
   }
 
-  function onAction(act, ver) {
+  function onAction(act, ver, name) {
     if (!api) return;
     if (act === 'download') {
       setStatus('开始下载 dsh ' + ver + '…', 'busy');
@@ -2873,6 +3545,12 @@ VERSION_MANAGER_HTML = """<!doctype html>
       api.cancel();
     } else if (act === 'dir') {
       api.open_slot_dir(ver);
+    } else if (act === 'home') {
+      api.open_home_dir(ver);
+    } else if (act === 'restore-bk') {
+      openRestoreConfirm(name);
+    } else if (act === 'delete-bk') {
+      openDeleteBackupConfirm(name);
     }
   }
 
@@ -2883,8 +3561,10 @@ VERSION_MANAGER_HTML = """<!doctype html>
     document.getElementById('dlg-body').innerHTML =
       '确定切换到 <b>' + esc(ver) + '</b> 吗？<br>'
       + '切换将<b>自动重启应用</b>（本地服务会中断几秒）。<br>'
-      + '预发布（alpha/beta）版本可能与现有会话数据不兼容，如有顾虑请先备份 '
-      + '%USERPROFILE%\\.dsh。';
+      + '重启前会<b>先停服务、自动备份</b>当前版本的配置（backups/auto，留 10 份）；'
+      + '新版本的配置目录不存在时会从当前这份复制一个副本。<br>'
+      + '预发布（alpha/beta）版本可能与现有会话数据不兼容，动手前也可以先点'
+      + '「备份配置」手动存一份。';
     document.getElementById('dlg-ok').textContent = '切换并重启';
     document.getElementById('mask').classList.add('show');
   }
@@ -2894,14 +3574,39 @@ VERSION_MANAGER_HTML = """<!doctype html>
     document.getElementById('dlg-title').textContent = '确认删除';
     document.getElementById('dlg-body').innerHTML =
       '确定删除已下载的 <b>' + esc(ver) + '</b> 吗？<br>'
-      + '这会连同它的依赖一起删掉（释放约 220 MB），以后要用得重新下载。';
+      + '这会连同它的依赖一起删掉（释放约 220 MB），以后要用得重新下载。<br>'
+      + '它的<b>配置目录不会被删</b>，想清掉就用列表里那一行的「配置目录」按钮进去手工删。';
     document.getElementById('dlg-ok').textContent = '删除';
+    document.getElementById('mask').classList.add('show');
+  }
+
+  function openRestoreConfirm(name) {
+    pendingRestore = name;
+    document.getElementById('dlg-title').textContent = '确认恢复配置';
+    document.getElementById('dlg-body').innerHTML =
+      '确定用备份 <b>' + esc(name) + '</b> 覆盖配置吗？<br>'
+      + '恢复前会<b>先把当前配置自动备份一次</b>（不会丢现在的状态）。<br>'
+      + '恢复的是当前活动版本时，会<b>停服务 → 恢复 → 重启服务</b>；'
+      + '别的版本要等切过去才生效。';
+    document.getElementById('dlg-ok').textContent = '恢复';
+    document.getElementById('mask').classList.add('show');
+  }
+
+  function openDeleteBackupConfirm(name) {
+    pendingDeleteBk = name;
+    document.getElementById('dlg-title').textContent = '确认删除备份';
+    document.getElementById('dlg-body').innerHTML =
+      '确定删除备份 <b>' + esc(name) + '</b> 吗？<br>'
+      + '删掉就找不回来了，只能靠池子里剩下的其它备份。';
+    document.getElementById('dlg-ok').textContent = '删除备份';
     document.getElementById('mask').classList.add('show');
   }
 
   function closeDialog() {
     pendingSwitch = null;
     pendingRemove = null;
+    pendingRestore = null;
+    pendingDeleteBk = null;
     document.getElementById('mask').classList.remove('show');
   }
 
@@ -2909,7 +3614,7 @@ VERSION_MANAGER_HTML = """<!doctype html>
     if (pendingSwitch) {
       var ver = pendingSwitch;
       closeDialog();
-      setStatus('正在切换到 dsh ' + ver + '…', 'busy');
+      setStatus('正在切换到 dsh ' + ver + '…（先备份配置）', 'busy');
       api.switch(ver).then(function (res) {
         if (!res.ok) { setStatus(res.error || '切换失败', 'err'); return; }
         restarting = true;
@@ -2920,8 +3625,27 @@ VERSION_MANAGER_HTML = """<!doctype html>
       closeDialog();
       setStatus('正在删除 dsh ' + target + '…', 'busy');
       api.remove(target).then(function (res) {
-        setStatus(res.ok ? ('已删除 dsh ' + target) : (res.error || '删除失败'), res.ok ? 'ok' : 'err');
+        setStatus(res.ok
+          ? ('已删除 dsh ' + target + (res.homeKept ? '；配置目录保留在 ' + res.homeDir : ''))
+          : (res.error || '删除失败'), res.ok ? 'ok' : 'err');
       }).catch(function (error) { setStatus('删除失败：' + error, 'err'); });
+    } else if (pendingRestore) {
+      var bkName = pendingRestore;
+      closeDialog();
+      setStatus('正在恢复配置 ' + bkName + '…', 'busy');
+      api.restore_backup(bkName).then(function (res) {
+        setStatus(res.ok ? ('已恢复配置：' + bkName) : (res.error || '恢复失败'),
+                  res.ok ? 'ok' : 'err');
+        if (res.ok) refresh();
+      }).catch(function (error) { setStatus('恢复失败：' + error, 'err'); });
+    } else if (pendingDeleteBk) {
+      var delName = pendingDeleteBk;
+      closeDialog();
+      api.delete_backup(delName).then(function (res) {
+        setStatus(res.ok ? ('已删除备份：' + delName) : (res.error || '删除失败'),
+                  res.ok ? 'ok' : 'err');
+        if (res.ok) refresh();
+      }).catch(function (error) { setStatus('删除备份失败：' + error, 'err'); });
     }
   }
 
@@ -2938,6 +3662,20 @@ VERSION_MANAGER_HTML = """<!doctype html>
       api.refresh();
     });
     document.getElementById('btn-slots-dir').addEventListener('click', function () { api.open_slots_dir(); });
+    document.getElementById('btn-backup').addEventListener('click', function () {
+      setStatus('正在备份配置…', 'busy');
+      api.backup().then(function (res) {
+        setStatus(res.ok ? ('已备份配置：' + res.name) : (res.error || '备份失败'),
+                  res.ok ? 'ok' : 'err');
+        if (res.ok) refresh();
+      }).catch(function (error) { setStatus('备份失败：' + error, 'err'); });
+    });
+    document.getElementById('btn-home-dir').addEventListener('click', function () {
+      api.open_home_dir(null);
+    });
+    document.getElementById('btn-backups-dir').addEventListener('click', function () {
+      api.open_backups_dir();
+    });
     document.getElementById('p-registry').addEventListener('change', function (ev) {
       var value = ev.target.value;
       setStatus('正在切换 npm 源…', 'busy');
@@ -3202,6 +3940,7 @@ class DshShellApp(object):
         total = 0
         for slot in slots:
             total += slot_size_mb(slot["dir"])
+        backups = list_backups()
         return {
             "versions": rows,
             "activeSlot": active,
@@ -3223,6 +3962,20 @@ class DshShellApp(object):
             "remoteStale": bool(remote.get("stale")),
             "remoteCheckedAt": remote.get("checkedAt") or 0,
             "remoteError": remote.get("error") or "",
+            # 配置目录（每版本一个 home）+ 备份清单（auto/manual 两个池子）
+            "homeDir": dsh_home(),
+            "homes": [
+                {
+                    "version": item["version"],
+                    "dir": item["dir"],
+                    "sizeMB": slot_size_mb(item["dir"]),
+                    "active": item["version"] == active,
+                }
+                for item in list_local_homes()
+            ],
+            "backups": backups,
+            "backupSizeMB": sum(item["sizeMB"] for item in backups),
+            "backupRetention": BACKUP_RETENTION,
             "task": self._vm_task_state(),
             "status": self.vm_status,
             "error": self.vm_error,
@@ -3377,15 +4130,33 @@ class DshShellApp(object):
 
     def _do_switch(self, ver):
         old = active_slot_version()
+        note = ""
         try:
+            # 先停服务、再备份旧版本的配置：会话 / 存储都是活文件，停机压出来的
+            # 快照才一致。停机时间 = 压缩耗时（home 几十 MB，几秒），状态行实时显示。
+            # 备份失败**不阻塞切换**（只记日志 + 状态行提一句）。
+            if old:
+                self.set_vm_status("正在停服务并备份 dsh %s 的配置…" % old)
+                self.service.stop()
+                res = backup_home(old, kind="auto", note=self.set_vm_status)
+                if res.get("ok"):
+                    note = "，已自动备份配置 %s" % res["name"]
+                else:
+                    note = "（配置备份失败：%s）" % (res.get("error") or "?")
+                    log("切换前备份配置失败: %s" % res.get("error"))
             set_active_slot(ver)
-            self.set_vm_status("正在切换到 dsh %s，应用将自动重启…" % ver)
-            log("切换版本: %s -> %s" % (old or "?", ver))
+            self.set_vm_status("正在切换到 dsh %s，应用将自动重启…%s" % (ver, note))
+            log("切换版本: %s -> %s%s" % (old or "?", ver, note))
             self.notify("正在切换到 dsh %s，应用即将重启…" % ver)
             # 等窗口先拿到 {ok: True} 的响应（js_api 调用是并行的，这里只是稳妥）
             time.sleep(1.2)
-            self._spawn_new_instance()
-            self.quit()          # 退出旧实例；_shutdown 会停掉服务
+            # 切换版本 = 换一套前端代码，但 WebView2 的 localStorage / 缓存 / cookie
+            # 是跨版本共用的（同一 origin http://127.0.0.1:3080）。旧版本写下的
+            # 存储格式新版本不一定兼容（例如 0.1.7 删掉的 sessionUpdatedAtByAccount
+            # 会让 0.1.5 的会话列表渲染崩溃），所以切换时让新实例清空整个 webview
+            # 配置目录，从干净状态启动。
+            self._spawn_new_instance(clear_webview=True)
+            self.quit()          # 退出旧实例；_shutdown 会停掉服务（已经停过，幂等）
         except Exception as exc:  # noqa: BLE001
             log("切换 dsh %s 失败: %s\n%s" % (ver, exc, traceback.format_exc()))
             if old and old != ver:
@@ -3403,8 +4174,13 @@ class DshShellApp(object):
             self.busy.release()
 
     @staticmethod
-    def _spawn_new_instance():
-        """拉起一个新实例（带 DSH_UI_RESTART=1，会在单实例锁上等本实例退出）。"""
+    def _spawn_new_instance(clear_webview=False):
+        """拉起一个新实例（带 DSH_UI_RESTART=1，会在单实例锁上等本实例退出）。
+
+        clear_webview=True 时额外带 DSH_UI_CLEAR_WEBVIEW=1：新实例拿到单实例锁
+        （旧实例已退出、WebView2 已释放文件）后先删掉整个 webview 配置目录再启动。
+        目前只有版本切换走这个分支（见 _do_switch）。
+        """
         if getattr(sys, "frozen", False):
             exe = sys.executable
             cmd = [exe]
@@ -3415,7 +4191,9 @@ class DshShellApp(object):
             raise RuntimeError("找不到可执行文件：%s" % exe)
         env = os.environ.copy()
         env["DSH_UI_RESTART"] = "1"
-        log("拉起新实例 %s" % " ".join(cmd))
+        if clear_webview:
+            env[CLEAR_WEBVIEW_ENV] = "1"
+        log("拉起新实例 %s%s" % (" ".join(cmd), "（切换版本，将清空 webview 配置）" if clear_webview else ""))
         subprocess.Popen(
             cmd,
             cwd=os.path.dirname(exe) or None,
@@ -3444,12 +4222,19 @@ class DshShellApp(object):
             return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
         try:
             size = slot_size_mb(path)          # 删除前取一次（缓存里有就直接用）
-            shutil.rmtree(path)
+            _rmtree(path)                      # 只读文件也得删得掉
             _slot_size_cache.pop(path, None)
-            self.set_vm_status("已删除 dsh %s（释放 %d MB）" % (ver, size))
-            log("已删除槽位: %s" % path)
+            # **只删代码，不删配置**：homes/<版本> 留着（以后重下还能接着用），
+            # 要清理由用户自己点「配置目录」进去手工删。
+            home = "" if _explicit_home_override() else home_dir_for(ver)
+            home_kept = (
+                "；配置目录保留在 %s（用每行的「配置目录」按钮打开后手工删）" % home
+                if home and os.path.isdir(home) else ""
+            )
+            self.set_vm_status("已删除 dsh %s（释放 %d MB）%s" % (ver, size, home_kept))
+            log("已删除槽位: %s%s" % (path, home_kept))
             self.notify("已删除 dsh %s" % ver)
-            return {"ok": True}
+            return {"ok": True, "homeDir": home, "homeKept": bool(home_kept)}
         except OSError as exc:
             log("删除槽位失败 %s: %s" % (path, exc))
             return {"ok": False, "error": "删除失败（可能有文件被占用）：%s" % exc}
@@ -3472,6 +4257,116 @@ class DshShellApp(object):
             self.notify("该版本没有下载过")
             return
         self._open_path(path)
+
+    # ---------------- 配置备份 / 配置目录 ---------------- #
+
+    def vm_backup(self):
+        """版本管理器「备份配置」：手动打包当前版本的配置（不打断服务）。"""
+        if not self.busy.acquire(blocking=False):
+            return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
+        try:
+            ver = active_slot_version()
+            self.set_vm_status("正在备份配置（%s）…" % (ver or "?"))
+            res = backup_home(ver, kind="manual", note=self.set_vm_status)
+            if res.get("ok"):
+                self.set_vm_status(
+                    "已备份配置：%s（%d MB，本池最多保留 %d 份）"
+                    % (res["name"], res["sizeMB"], BACKUP_RETENTION)
+                )
+                self.notify("配置备份完成")
+            else:
+                self.set_vm_status("备份失败：%s" % res.get("error"), True)
+                self.notify("配置备份失败")
+            return res
+        finally:
+            self.busy.release()
+
+    def vm_delete_backup(self, name):
+        """删掉一份备份（名字必须落在备份池里）。"""
+        res = delete_backup(name)
+        if res.get("ok"):
+            self.set_vm_status("已删除备份：%s" % res["name"])
+            log("删除配置备份: %s" % res["name"])
+        else:
+            self.set_vm_status("删除备份失败：%s" % res.get("error"), True)
+        return res
+
+    def vm_restore_backup(self, name):
+        """恢复一份备份到它自己的版本目录。
+
+        恢复活动版本时：**先停服务**（文件是活的）-> restore_backup() 内部会先把
+        当前配置自动备份一次 -> 解压换名 -> 重新同步插件 -> 起服务 -> 刷新页面。
+        """
+        ver = version_from_backup_name(name)
+        if not ver:
+            return {"ok": False, "error": "备份名里读不出版本号：%s" % name}
+        if not self.busy.acquire(blocking=False):
+            return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
+        try:
+            active = active_slot_version()
+            was_running = bool(ver == active and self.service.managed_running())
+            if was_running:
+                self.set_vm_status("正在恢复配置（%s）：先停服务…" % ver)
+                self.service.stop()
+            else:
+                self.set_vm_status("正在恢复配置（%s）…" % ver)
+            res = restore_backup(name, note=self.set_vm_status)
+            if not res.get("ok"):
+                self.set_vm_status("恢复失败：%s" % res.get("error"), True)
+                self.notify("恢复配置失败")
+                if was_running:
+                    self._resume_after_task()
+                return res
+            if was_running:
+                # 恢复出来的 profile 和外壳的插件开关可能对不上，重新同步一遍
+                try:
+                    sync_plugins(on_note=self.set_plugin_status)
+                except Exception as exc:  # noqa: BLE001
+                    log("恢复后同步插件异常: %s" % exc)
+                self._resume_after_task()
+                self.set_vm_status("已恢复配置并重启服务（dsh %s）" % ver)
+            elif ver == active:
+                self.set_vm_status("已恢复配置（dsh %s，重启服务后生效）" % ver)
+            else:
+                self.set_vm_status("已恢复配置：%s -> %s（切到 dsh %s 后生效）"
+                                   % (name, res["dir"], ver))
+            self.notify("配置已恢复")
+            return res
+        except Exception as exc:  # noqa: BLE001
+            log("恢复配置异常: %s\n%s" % (exc, traceback.format_exc()))
+            self.set_vm_status("恢复失败：%s" % exc, True)
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy.release()
+
+    def _resume_after_task(self):
+        """任务里停掉的服务拉回来；失败只记日志 + 状态行，不抛。"""
+        try:
+            self.service.start()
+            if self.service.wait_ready():
+                self.load_url()
+        except Exception as exc:  # noqa: BLE001
+            log("恢复服务失败: %s" % exc)
+            self.set_vm_status("服务没能自动拉起：%s（可点托盘『重启服务』）" % exc, True)
+
+    def vm_open_home_dir(self, version=None):
+        """打开某个版本的**配置目录**（删槽位后手工清理 / 直接看文件就靠它）。"""
+        ver = sanitize_version(version) or active_slot_version()
+        path = _home_for_version(ver) if ver else dsh_home()
+        if not os.path.isdir(path):
+            self.notify("配置目录还不存在：%s" % path)
+            return {"ok": False, "error": "配置目录还不存在：%s" % path}
+        self._open_path(path)
+        return {"ok": True, "path": path}
+
+    def vm_open_backups_dir(self):
+        """打开备份根目录（两池子 auto / manual 在它下面）。"""
+        try:
+            os.makedirs(BACKUPS_ROOT, exist_ok=True)
+        except OSError:
+            pass
+        self._open_path(BACKUPS_ROOT)
+        return {"ok": True, "path": BACKUPS_ROOT}
 
     # ---------------- 插件状态 / 同步 / 生效 ---------------- #
 
@@ -3565,6 +4460,13 @@ class DshShellApp(object):
         try:
             mark("_ensure_service: 启动流程开始")
 
+            # 每版本配置目录：缺了先从「切换前那份 home」拷副本（已存在不动）。
+            # 必须在插件同步之前 —— 同步要写进 dsh_home() 底下的 profiles/。
+            try:
+                ensure_version_home(note=self.set_plugin_status)
+            except Exception as exc:  # noqa: BLE001
+                log("准备配置目录异常（继续启动）: %s" % exc)
+
             # 启动前先按「已启用的插件」把 plugins/ 镜像进 dsh 并刷新补丁文件。
             # 失败不阻塞启动：dsh 照常按现有补丁跑。
             try:
@@ -3602,6 +4504,13 @@ class DshShellApp(object):
                 version = self.service.installed_version()
                 log("安装完成，版本 %s（槽位 %s）"
                     % (version, active_slot_dir()))
+                # 首装这一刻才定下活动版本 —— 前面那次同步写的是老 home，
+                # 这里补建 homes/<版本> 并再同步一次插件。
+                try:
+                    ensure_version_home(note=self.set_plugin_status)
+                    _timed("sync_plugins(首装后)", sync_plugins, on_note=self.set_plugin_status)
+                except Exception as exc:  # noqa: BLE001
+                    log("首装后准备配置目录/同步插件异常（继续启动）: %s" % exc)
 
             # dsh 的访问 token 每次启动都会变，必须由本程序自己拉起服务才能拿到地址，
             # 所以端口上如果有残留进程，先清掉再重新启动。
@@ -3920,6 +4829,26 @@ class VersionManagerApi(object):
 
     def open_slot_dir(self, version):
         self._app.vm_open_slot_dir(version)
+
+    # ---- 配置备份 / 配置目录（每版本一个 home） ----
+
+    def backup(self):
+        """手动备份当前版本的配置（窗口里「备份配置」按钮）。"""
+        return self._app.vm_backup()
+
+    def restore_backup(self, name):
+        """恢复一份备份（**前端必须先弹窗口内确认框**）。"""
+        return self._app.vm_restore_backup(name)
+
+    def delete_backup(self, name):
+        return self._app.vm_delete_backup(name)
+
+    def open_home_dir(self, version=None):
+        """打开某个版本的配置目录（删槽位后手工清理用）。"""
+        return self._app.vm_open_home_dir(version)
+
+    def open_backups_dir(self):
+        return self._app.vm_open_backups_dir()
 
     def open_log(self):
         self._app._open_path(SHELL_LOG)
@@ -4247,6 +5176,20 @@ def main():
         return
     mark("单实例锁就绪")
 
+    # 版本切换（_do_switch -> _spawn_new_instance(clear_webview=True)）时，新实例
+    # 带着 DSH_UI_CLEAR_WEBVIEW=1 启动。拿到单实例锁 = 旧实例已完全退出、WebView2
+    # 进程已释放文件锁，此时删掉整个 webview 配置目录最安全（localStorage / 缓存 /
+    # cookie 全部清空，避免跨版本格式不兼容把新版本前端带崩）。删完重建空目录，
+    # 后续 webview.start(storage_path=WEBVIEW_DIR) 会从干净状态初始化。
+    if (os.environ.get(CLEAR_WEBVIEW_ENV) or "").strip() == "1":
+        try:
+            if os.path.isdir(WEBVIEW_DIR):
+                _rmtree(WEBVIEW_DIR)
+                log("已清空 webview 配置目录（版本切换）: %s" % WEBVIEW_DIR)
+            os.makedirs(WEBVIEW_DIR, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            log("清空 webview 配置目录失败（继续启动）: %s" % exc)
+
     # 多槽位布局：先清掉上次异常退出留下的 *.dl 半成品，再把老单目录迁进
     # slots/<版本>/（同卷 rename，瞬间完成）。都在服务启动之前做。
     try:
@@ -4260,6 +5203,23 @@ def main():
         log("旧布局迁移异常（继续启动）: %s" % exc)
     log("活动槽位: %s（活动版本 %s）"
         % (active_slot_dir(), active_slot_version() or "未安装"))
+
+    # 每版本配置目录：缺了先从「切换前那份 home」拷副本（已存在一个字节不动）。
+    # 必须在任何 dsh_home() 消费者（插件同步 / 信息面板）之前跑。
+    try:
+        cleanup_partial_homes()
+        home_info = ensure_version_home()
+        if home_info.get("created"):
+            mark("配置目录已就绪: %s（来源 %s）"
+                 % (home_info["dir"], home_info.get("source") or "全新"))
+    except Exception as exc:  # noqa: BLE001
+        log("准备配置目录异常（继续启动）: %s" % exc)
+    if (os.environ.get("DSH_HOME") or "").strip():
+        # 见 _explicit_home_override()：环境里这个值多半是从 dsh 终端泄漏进来的，
+        # 不参与解析（服务子进程那边会被外壳重新注入）。说出来免得用户困惑。
+        log("忽略环境变量 DSH_HOME=%s（每版本配置目录由外壳接管；"
+            "想固定一个目录请写 config.json 的 dshHome）" % os.environ.get("DSH_HOME"))
+    log("dsh 配置目录: %s" % dsh_home())
 
     # 启动即阻止系统睡眠（不阻止息屏/锁屏），退出时在 _shutdown 里释放。
     keep_system_awake()

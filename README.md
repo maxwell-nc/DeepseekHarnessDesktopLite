@@ -23,8 +23,14 @@
   槽位数超过上限（默认 5）**只在页面里提示**（非弹窗），并给「去清理」跳转按钮。
   托盘**没有**「检查更新」和「选源」入口 —— 检查/下载/切换/删除**和换 npm 源**
   全在版本管理器里（换源用窗口顶部的下拉框：npmmirror / 华为云 / 腾讯云 / 跟随系统）
+- **配置目录与备份**：每个版本一份 dsh home（`homes\<版本>\` —— 登录态、设置、
+  会话、profile 全在里面），第一次给某版本建目录时**从切换前那份拷一个副本**过来，
+  已存在就一个字节不动；切换前**先停服务再自动备份**旧配置（`backups\auto\`），
+  版本管理器里另有手动「备份配置」和**恢复 / 删除**清单 —— auto、manual 两个池子
+  **各留最近 10 份**。删槽位**不删配置**，列表每行的「配置目录」按钮可打开手工清理
 - **插件自动加载**：启动时按启用状态把 exe 同目录 `plugins/` 里的插件装进 dsh
-  （`~/.dsh/profiles/web/`），关掉的就撤下来，不用手工改 dsh 的配置
+  （`homes\<版本>\profiles\web\`，见下面「配置目录与备份」），
+  关掉的就撤下来，不用手工改 dsh 的配置
 - **默认走国内镜像**（`registry.npmmirror.com`）：首次安装时在启动页三选一，
   之后下载/检查更新都沿用它（配置在 `config.json` 的 `registry`；
   日常换源走版本管理器窗口顶部的下拉框，托盘不提供入口）
@@ -33,7 +39,7 @@
 
 ```
 src/                         代码（含构建、打包、自测）
-├── dsh_shell.py             主程序（服务管理 / WebView2 / 托盘 / 版本槽位 / 插件同步 / 三个界面）
+├── dsh_shell.py             主程序（服务管理 / WebView2 / 托盘 / 版本槽位 / 配置目录与备份 / 插件同步 / 三个界面）
 ├── app_icon.py              运行时绘制图标，无外部资源依赖
 ├── build.py                 一键打包入口
 ├── assets/app.ico           打包用的图标（缺了 build.py 会按 app_icon.py 重新生成）
@@ -44,7 +50,7 @@ src/                         代码（含构建、打包、自测）
     ├── probe_auth.py            鉴权链路：401 → 303 + Set-Cookie → 200
     ├── probe_gui.py             GUI + 托盘：发 WM_CLOSE，确认收进托盘且进程存活
     ├── probe_update.py          多槽位版本链路：远端列表（含 alpha）/ 下载 / 占用
-    ├── probe_version_manager.py 版本管理器窗口 + js_api 桥 + 切换确认框
+    ├── probe_version_manager.py 版本管理器窗口 + js_api 桥 + 每版本配置目录 + 备份/恢复
     ├── probe_plugins.py         插件同步：扫描 → 镜像进 dsh → 重写托管补丁块
     └── probe_plugin_manager.py  插件管理器窗口 + js_api 桥 + 红绿灯渲染
 
@@ -115,17 +121,22 @@ dist/                        整个目录就是程序目录
 | --- | --- | --- |
 | `runtime/slots/<版本>/` | dsh 的版本槽位，一个版本一个完整 npm 工程根（各约 220 MB，可并存多个，下载/切换都在这里） | 需要的版本重新下载（走 npm 缓存会快很多） |
 | `runtime/` | 槽位的父目录；老布局残留会在此被自动迁移进 `slots/` | 同上 |
+| `homes/<版本>/` | **每版本一份 dsh home**（登录态、设置、会话、profile）：首建时从切换前那份拷副本 | 该版本回到空配置（登录 / 会话丢），可从备份恢复 |
+| `backups/{auto,manual}/` | 配置备份 zip：切换前自动备 + 版本管理器手动备，两池各留最近 10 份 | 丢掉历史备份（不影响当前配置） |
 | `workspace/` | dsh 启动时的工作目录 | 里面放过东西的话就没了 |
 | `webview/` | WebView2 用户数据（Cookie、localStorage） | 界面偏好重置；登录态由下面的 `.dsh` 决定 |
-| `config.json` | 配置：`registry`（npm 源，留空=跟随系统）、`activeSlot`（当前活动版本）、`maxSlots`（槽位上限，默认 5）、`versionsCache`（远端版本列表缓存） | 回到默认（国内镜像），活动版本按本地槽位自动探测 |
+| `config.json` | 配置：`registry`（npm 源，留空=跟随系统）、`activeSlot`（当前活动版本）、`maxSlots`（槽位上限，默认 5）、`versionsCache`（远端版本列表缓存）、`dshHome`（可选：写死一个不分版本的配置目录） | 回到默认（国内镜像），活动版本按本地槽位自动探测 |
 | `plugins.json` | 插件启用状态（插件管理器写，红灯/绿灯就是它） | 所有插件回到默认「开启」 |
 | `data/usage.json` | usage 插件的 token 账本 | 用量统计清零（从零开始记） |
 | `shell.log` / `service.log` / `stdio.log` | 日志 | 无影响 |
 
-**② `%USERPROFILE%\.dsh\`** —— dsh 自己的数据目录，**这个才是有状态的部分**：
+**② `%LOCALAPPDATA%\DeepSeekHarness\homes\<版本>\`** —— dsh 自己的数据目录，**按版本一份**：
 `.credentials.yaml`（账号凭据）、`sessions/`（会话历史）、`storages/`、
 `settings.yaml`，加上 `profiles/web/`（profile、插件安装副本、`cordis.patch.yml`）。
-换机器想保住登录和聊天记录，要带的是它。
+换机器想保住登录和聊天记录，要带的是**当前活动版本这一份**；老的 `%USERPROFILE%\.dsh\`
+现在只作为首次迁移的种子源留在原地（下次启动会把它拷成第一份版本 home）。
+想固定一个**不分版本**的目录，可以在 `config.json` 里写 `dshHome`（外壳会把它
+连同 `DSH_HOME` 一起注入服务子进程，两边永远读同一份）。
 
 ## 插件
 
@@ -177,12 +188,12 @@ dist/
 
 1. 扫 `plugins/` **和** `plugins-third-party/` 下所有带 `manifest.json` 的包
    （第三方目录不存在就跳过）；没记录过的插件默认**开启**；
-2. 开启的包 → 整目录镜像到 `%USERPROFILE%\.dsh\profiles\web\plugins\<id>\`
+2. 开启的包 → 整目录镜像到 `homes\<版本>\profiles\web\plugins\<id>\`
    （源目录没变就跳过复制，靠 `.dsh-ui-plugin.json` 指纹判断；包**根目录**下的 `data/`
    是插件的运行态，既不复制也不进指纹 —— 插件自己的数据放 `<数据目录>/data/`）；
 3. 关闭的包 → 删掉安装副本（只删本程序装的，认指纹文件；目录链接一律不碰）；
 4. 把已启用插件的补丁片段按 `order` 拼成一个托管块，重写
-   `~/.dsh/profiles/web/cordis.patch.yml` ——
+   `homes\<版本>\profiles\web\cordis.patch.yml` ——
    两个 `dsh-ui 插件管理块` 标记之外的内容原样保留，没有插件时回到 `[]`。
 
 插件目录里 `cordis.patch.yml` 的 `./plugins/<id>/<entry>` 是**相对 profile 目录**的
@@ -380,7 +391,7 @@ dsh 那 3.0 秒里：
 
 ```bash
 <venv>/Scripts/python.exe src/tools/probe_plugins.py --list      # 只看扫描到哪些插件
-<venv>/Scripts/python.exe src/tools/probe_plugins.py             # 真同步一次到 ~/.dsh
+<venv>/Scripts/python.exe src/tools/probe_plugins.py             # 真同步一次到 homes/<版本>
 # 想不碰真实环境，指向临时目录：
 <venv>/Scripts/python.exe src/tools/probe_plugins.py \
     --plugins-dir <临时插件目录> --dsh-home <临时 dsh 目录>

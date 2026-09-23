@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
-"""版本管理器窗口自测：真起 WebView2，打开窗口，用窗口里的 JS 调桥读回状态。
+"""版本管理器窗口自测：每版本配置目录 + 备份/恢复 + 窗口/js_api 桥。
 
-**不启动 dsh 服务**（只测窗口、js_api 桥、列表/确认框的 DOM）。
+**不启动 dsh 服务**、**不碰真实数据**：homes/ 与 backups/ 全指向临时目录。
 
     <venv>/Scripts/python.exe src/tools/probe_version_manager.py
 
-约 12 秒后自动关窗退出，退出码 0 表示通过。
+两段自测：
+  1. fs_tests()  —— 种子复制（必须跳过 junction）、每池 10 份淘汰、恢复
+                    （只读附件对象要删得掉）、路径穿越拒绝、DSH_HOME 一致性；
+  2. 窗口       —— 头部配置目录行、备份按钮 / 备份清单 / 恢复·删除确认框。
+
+约 15 秒后自动关窗退出，退出码 0 表示通过。
 带 `--net` 时会额外调一次 api.refresh()（真的打一条 npm view，需要网络）。
 """
 
 import json
 import os
+import stat
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)                                    # <项目根>/src
@@ -35,7 +44,130 @@ def check(label, condition, detail=""):
         FAILURES.append(label)
 
 
+
+def fs_tests():
+    """每版本配置目录 + 备份/恢复的文件系统自测（临时根目录）。"""
+    tmp = tempfile.mkdtemp(prefix="dsh-home-probe-")
+    dsh_shell.HOMES_ROOT = os.path.join(tmp, "homes")
+    dsh_shell.BACKUPS_ROOT = os.path.join(tmp, "backups")
+
+    # 种子源 = 「切换前那份 home」：带 junction（profiles/node_modules 的
+    # 404 条链接就是这个形态）+ 只读对象（dsh attachments 就是 0o444）。
+    src = dsh_shell.home_dir_for("0.0.1")
+    os.makedirs(os.path.join(src, "profiles", "web"), exist_ok=True)
+    with open(os.path.join(src, "profiles", "web", "package.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"name": "dsh-profile-web"}')
+    with open(os.path.join(src, ".credentials.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("token: abc\n")
+    obj_dir = os.path.join(src, "attachments", "objects")
+    os.makedirs(obj_dir, exist_ok=True)
+    obj = os.path.join(obj_dir, "deadbeef")
+    with open(obj, "w", encoding="utf-8") as fh:
+        fh.write("blob")
+    os.chmod(obj, stat.S_IREAD)
+    outside = os.path.join(tmp, "outside")
+    os.makedirs(outside, exist_ok=True)
+    with open(os.path.join(outside, "index.js"), "w", encoding="utf-8") as fh:
+        fh.write("x" * 4096)
+    nm = os.path.join(src, "profiles", "node_modules")
+    os.makedirs(nm, exist_ok=True)
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", os.path.join(nm, "xxx"), outside],
+        capture_output=True,
+    )
+    check("自测造出了 junction", dsh_shell._is_reparse(os.path.join(nm, "xxx")))
+
+    res = dsh_shell.ensure_version_home("0.0.2")
+    dest = dsh_shell.home_dir_for("0.0.2")
+    check("新版本配置目录已创建（种子复制）", res.get("created") is True, str(res))
+    check("种子源是切换前那份 home", res.get("source") == src, str(res.get("source")))
+    check("凭据被复制过去", os.path.isfile(os.path.join(dest, ".credentials.yaml")))
+    check("profile 被复制过去",
+          os.path.isfile(os.path.join(dest, "profiles", "web", "package.json")))
+    check("**junction 没被复制**（不会把旧槽位 220 MB 拖进来）",
+          not os.path.exists(os.path.join(dest, "profiles", "node_modules", "xxx")))
+    marker = os.path.join(dest, "MARKER")
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("keep")
+    res = dsh_shell.ensure_version_home("0.0.2")
+    check("目录已存在就不再拷贝（一个字节不动）",
+          res.get("created") is False and os.path.isfile(marker), str(res))
+
+    # 手动备份 13 次 -> 池子里只留 10 份（utime 强制时间递增，省掉 sleep）
+    names = []
+    base = time.time() - 400
+    for i in range(13):
+        r = dsh_shell.backup_home("0.0.2", kind="manual")
+        names.append(r.get("name"))
+        os.utime(r["path"], (base + i, base + i))
+    manual = [b for b in dsh_shell.list_backups() if b["kind"] == "manual"]
+    kept = {b["name"] for b in manual}
+    check("手动池只留 10 份", len(manual) == 10, "%d 份" % len(manual))
+    # 同秒创建会带 -N 后缀，且被淘汰后名字可能被复用 —— 所以按 mtime 判：
+    # 留下的 10 份必须全都比第 3 旧的时间戳新（最早的 3 个时间点已消失）。
+    ats = sorted(b["at"] for b in manual)
+    check("淘汰的是时间最早的 3 份",
+          len(ats) == 10 and ats[0] >= int((base + 3) * 1000),
+          str([time.strftime("%H:%M:%S", time.localtime(a / 1000)) for a in ats[:4]]))
+    newest = manual[0]["name"]
+    with zipfile.ZipFile(os.path.join(dsh_shell.BACKUPS_ROOT, "manual", newest)) as zf:
+        entries = zf.namelist()
+    check("zip 里没有 junction 指向的文件", not any("xxx" in e for e in entries),
+          str(entries)[:160])
+    check("zip 里有只读对象", any(e.endswith("deadbeef") for e in entries), str(entries)[:160])
+
+    # auto 池独立（切换前的自动备份不会冲掉手动备份）
+    for i in range(3):
+        r = dsh_shell.backup_home("0.0.2", kind="auto")
+        os.utime(r["path"], (base + 100 + i, base + 100 + i))
+    check("auto / manual 两池各留各的",
+          len([b for b in dsh_shell.list_backups() if b["kind"] == "auto"]) == 3
+          and len([b for b in dsh_shell.list_backups() if b["kind"] == "manual"]) == 10,
+          str(dsh_shell.list_backups())[:160])
+
+    # 恢复：把配置改坏 -> 用最新备份还原
+    with open(os.path.join(dest, ".credentials.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("token: BROKEN\n")
+    with open(os.path.join(dest, "JUNK"), "w", encoding="utf-8") as fh:
+        fh.write("x")
+    res = dsh_shell.restore_backup(newest)
+    check("恢复成功", res.get("ok") is True, str(res))
+    with open(os.path.join(dest, ".credentials.yaml"), encoding="utf-8") as fh:
+        check("配置回到备份时的内容", fh.read() == "token: abc\n")
+    check("恢复后多余文件被清掉", not os.path.exists(os.path.join(dest, "JUNK")))
+    restored_obj = os.path.join(dest, "attachments", "objects", "deadbeef")
+    check("只读对象恢复后仍是只读",
+          os.path.isfile(restored_obj)
+          and bool(os.stat(restored_obj).st_mode & stat.S_IREAD),
+          oct(os.stat(restored_obj).st_mode) if os.path.isfile(restored_obj) else "缺失")
+    check("恢复前自动备份了一份（auto 池 +1）",
+          len([b for b in dsh_shell.list_backups() if b["kind"] == "auto"]) == 4)
+    check("没有 .restoring / .old 残留",
+          not [n for n in os.listdir(dsh_shell.HOMES_ROOT)
+               if n.endswith((".restoring", ".old"))],
+          str(os.listdir(dsh_shell.HOMES_ROOT)))
+
+    # 路径穿越 / 非法名必须被后端拒掉
+    check("恢复 ../../x.zip 被拒",
+          dsh_shell.restore_backup("../../x.zip").get("ok") is False)
+    check("删除非法备份名被拒",
+          dsh_shell.delete_backup("nope.zip").get("ok") is False)
+    check("备份名能解析出版本", dsh_shell.version_from_backup_name(newest) == "0.0.2",
+          str(dsh_shell.version_from_backup_name(newest)))
+
+    # 外壳和服务子进程必须读同一份配置
+    active = dsh_shell.active_slot_version()
+    if active:
+        check("dsh_home() 指向活动版本的配置目录",
+              dsh_shell.dsh_home() == dsh_shell.home_dir_for(active), dsh_shell.dsh_home())
+        check("服务子进程拿到同一个 DSH_HOME",
+              dsh_shell.DshService._child_env(None, None)["DSH_HOME"] == dsh_shell.dsh_home())
+    return tmp
+
+
 def main():
+    tmp_root = fs_tests()
+
     app = dsh_shell.DshShellApp()
     app.vm_status = "自测：窗口已加载"
 
@@ -74,8 +206,20 @@ def main():
             check("js_api.state() 有返回", bool(state), raw[:120])
             for key in ("versions", "activeSlot", "slotCount", "maxSlots",
                         "busy", "checking", "task", "registry",
-                        "registryUrl", "registryChoices"):
+                        "registryUrl", "registryChoices",
+                        # 每版本配置目录 + 备份清单
+                        "homeDir", "homes", "backups", "backupRetention"):
                 check("state 有字段 %s" % key, key in state, ",".join(sorted(state)))
+            check("backupRetention 是 10", state.get("backupRetention") == 10,
+                  str(state.get("backupRetention")))
+            check("homeDir 指向每版本配置目录（homes 下的活动版本）",
+                  os.path.basename(os.path.dirname(state.get("homeDir") or "")) == "homes",
+                  str(state.get("homeDir")))
+            check("homes 是列表", isinstance(state.get("homes"), list),
+                  str(type(state.get("homes"))))
+            check("fs 自测留下的备份在 state.backups 里",
+                  len(state.get("backups") or []) >= 4,
+                  str(len(state.get("backups") or [])))
             check("registryChoices 是列表且至少 3 个源",
                   isinstance(state.get("registryChoices"), list)
                   and len(state.get("registryChoices")) >= 3,
@@ -92,6 +236,13 @@ def main():
                 "JSON.stringify({"
                 "btnRefresh: !!document.getElementById('btn-refresh'),"
                 "btnSlots: !!document.getElementById('btn-slots-dir'),"
+                "btnBackup: !!document.getElementById('btn-backup'),"
+                "btnHome: !!document.getElementById('btn-home-dir'),"
+                "btnBackupsDir: !!document.getElementById('btn-backups-dir'),"
+                "homeText: (document.getElementById('p-home')||{}).textContent||'',"
+                "bkRows: document.querySelectorAll('#bk-list .row').length,"
+                "bkHint: (document.getElementById('bk-hint')||{}).textContent||'',"
+                "bkEmpty: !!document.querySelector('#bk-list .empty'),"
                 "quotaShown: document.getElementById('quota').classList.contains('show'),"
                 "quotaBtn: !!document.getElementById('btn-clean'),"
                 "maskShown: document.getElementById('mask').classList.contains('show'),"
@@ -113,6 +264,14 @@ def main():
                   (info.get("regValue") or "") == (state.get("registryUrl") or ""),
                   "%r vs %r" % (info.get("regValue"), state.get("registryUrl")))
             check("打开槽位目录按钮在", bool(info.get("btnSlots")), str(info))
+            check("「备份配置」按钮在", bool(info.get("btnBackup")), str(info))
+            check("「打开配置目录」按钮在", bool(info.get("btnHome")), str(info))
+            check("「打开备份目录」按钮在", bool(info.get("btnBackupsDir")), str(info))
+            check("头部显示了配置目录", bool(info.get("homeText")), str(info.get("homeText")))
+            check("备份清单渲染出了行", int(info.get("bkRows") or 0) >= 1,
+                  "%s 行" % info.get("bkRows"))
+            check("备份提示写明保留 10 份", "10" in (info.get("bkHint") or ""),
+                  str(info.get("bkHint")))
             check("默认不弹确认框（mask 隐藏）", not info.get("maskShown"), str(info))
             check("默认没有重启遮罩", not info.get("restartShown"), str(info))
             check("已下载数没超限时提示条隐藏",
@@ -145,12 +304,69 @@ def main():
             )
             check("取消后确认框收起", closed in ("false", False), str(closed))
 
+            # 3b) 恢复备份也必须先过窗口内确认框（且和切换框互不串台）
+            manager.evaluate_js(
+                "openRestoreConfirm('9.9.9__20260101-000000.zip'); 1"
+            )
+            time.sleep(0.5)
+            dlg = json.loads(manager.evaluate_js(
+                "JSON.stringify({"
+                "shown: document.getElementById('mask').classList.contains('show'),"
+                "title: document.getElementById('dlg-title').textContent,"
+                "body: document.getElementById('dlg-body').textContent,"
+                "ok: document.getElementById('dlg-ok').textContent"
+                "})"
+            ) or "{}")
+            check("恢复确认框弹出", bool(dlg.get("shown")), str(dlg))
+            check("恢复确认框标题对", "恢复" in (dlg.get("title") or ""), str(dlg.get("title")))
+            check("恢复确认写明会先备份当前",
+                  "备份" in (dlg.get("body") or ""), str(dlg.get("body"))[:120])
+            check("恢复确认按钮是「恢复」", dlg.get("ok") == "恢复", str(dlg.get("ok")))
+            manager.evaluate_js("closeDialog(); 1")
+            time.sleep(0.3)
+
+            manager.evaluate_js("openDeleteBackupConfirm('x.zip'); 1")
+            time.sleep(0.5)
+            dlg = json.loads(manager.evaluate_js(
+                "JSON.stringify({"
+                "shown: document.getElementById('mask').classList.contains('show'),"
+                "title: document.getElementById('dlg-title').textContent,"
+                "ok: document.getElementById('dlg-ok').textContent"
+                "})"
+            ) or "{}")
+            check("删除备份确认框弹出", bool(dlg.get("shown")), str(dlg))
+            check("删除备份确认按钮是「删除备份」", dlg.get("ok") == "删除备份",
+                  str(dlg.get("ok")))
+            manager.evaluate_js("closeDialog(); 1")
+            time.sleep(0.3)
+            pend = json.loads(manager.evaluate_js(
+                "JSON.stringify({sw: !!pendingSwitch, rm: !!pendingRemove,"
+                " rs: !!pendingRestore, db: !!pendingDeleteBk})"
+            ) or "{}")
+            check("closeDialog 清干净所有 pending",
+                  not any(pend.values()), str(pend))
+            manager.evaluate_js("openRestoreConfirm('a.zip'); 1")
+            time.sleep(0.3)
+            pend = json.loads(manager.evaluate_js(
+                "JSON.stringify({rs: !!pendingRestore, sw: !!pendingSwitch})"
+            ) or "{}")
+            check("恢复框置位 pendingRestore", pend.get("rs") is True
+                  and pend.get("sw") is False, str(pend))
+            manager.evaluate_js("closeDialog(); 1")
+            time.sleep(0.3)
+            pend = json.loads(manager.evaluate_js(
+                "JSON.stringify({rs: !!pendingRestore})"
+            ) or "{}")
+            check("关闭后 pendingRestore 复位", pend.get("rs") is False, str(pend))
+
             # 4) 拒绝路径（后端校验，不产生写操作）
             #    js_api 方法返回的是 Promise，必须等 then 之后再读，不能直接 stringify
             for name, call in (
                 ("sw", "switch('9.9.9')"),
                 ("rm", "remove('9.9.9')"),
                 ("dl", "download('../x')"),
+                ("rs", "restore_backup('../../evil.zip')"),
+                ("db", "delete_backup('nope.zip')"),
             ):
                 manager.evaluate_js(
                     "window.pywebview.api.%s.then(function (r) { window.__%s = r; return 1 })"
@@ -163,6 +379,30 @@ def main():
                 res = json.loads(raw) if raw else {}
                 check("%s 返回对象" % name, isinstance(res, dict) and "ok" in res, str(res))
                 check("%s 被拒绝（ok=False）" % name, res.get("ok") is False, str(res))
+
+            # 4b) 桥的「备份配置」按钮：真的产一份，state.backups 里要能看到
+            before = len(state.get("backups") or [])
+            manager.evaluate_js(
+                "window.pywebview.api.backup().then(function (r) { window.__bk = r; return 1 })"
+            )
+            time.sleep(2.5)
+            raw = manager.evaluate_js("window.__bk ? JSON.stringify(window.__bk) : ''")
+            bk = json.loads(raw) if raw else {}
+            check("backup() 返回 ok", bk.get("ok") is True, str(bk))
+            check("备份名带版本号和时间戳",
+                  bool(bk.get("name")) and str(bk.get("name")).endswith(".zip"),
+                  str(bk.get("name")))
+            manager.evaluate_js(
+                "window.pywebview.api.state().then(function (s) { window.__probe2 = s; return 1 })"
+            )
+            time.sleep(1.5)
+            raw = manager.evaluate_js("window.__probe2 ? JSON.stringify(window.__probe2) : ''")
+            state2 = json.loads(raw) if raw else {}
+            check("手动备份出现在 state.backups",
+                  len(state2.get("backups") or []) == before + 1,
+                  "%d -> %d" % (before, len(state2.get("backups") or [])))
+            check("状态行读到了备份完成文案", "备份" in (state2.get("status") or ""),
+                  str(state2.get("status")))
 
             # 5) 可选：真打一次 npm view（--net）
             if WANT_NET:
@@ -199,6 +439,10 @@ def main():
                   storage_path=dsh_shell.WEBVIEW_DIR)
 
     print("")
+    try:
+        dsh_shell._rmtree(tmp_root)
+    except OSError:
+        pass
     if FAILURES:
         print("自测失败 %d 项：%s" % (len(FAILURES), "；".join(FAILURES)))
         return 1
