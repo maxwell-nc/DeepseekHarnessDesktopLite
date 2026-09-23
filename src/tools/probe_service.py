@@ -33,16 +33,19 @@ print("已安装版本    :", svc.installed_version())
 print("npm registry  :", sh.effective_registry() or "(跟随系统)")
 
 if not svc.installed_version():
-    step("2. npm install @deepseek-ai/dsh")
+    step("2. npm install @deepseek-ai/dsh -> 新槽位（首装也走多版本布局）")
     t0 = time.time()
-    ok, out = svc.npm_install(
-        sh.PACKAGE, lambda line: print("  npm> %s" % line, flush=True)
+    ok, installed_ver, out = svc.install_to_slot(
+        sh.PACKAGE, None, lambda line: print("  npm> %s" % line, flush=True)
     )
-    print("耗时 %.1fs  成功=%s" % (time.time() - t0, ok))
+    print("耗时 %.1fs  成功=%s  版本=%s" % (time.time() - t0, ok, installed_ver))
     print("---- 末尾输出 ----")
     print(out[-1500:])
     if not ok:
         sys.exit(1)
+    if installed_ver:
+        sh.set_active_slot(installed_ver)
+    print("槽位目录      :", sh.active_slot_dir())
 
 print("\n安装后版本    :", svc.installed_version())
 print("入口脚本      :", svc.entry_script())

@@ -13,31 +13,38 @@
   `CREATE_NO_WINDOW` 静默拉起
 - **系统托盘**：关闭窗口只是收进托盘，服务继续在后台跑；托盘菜单可重新打开界面，
   可「重启服务」（只重启本地 dsh 服务，应用不动）或「重启应用」（先拉起新实例
-  再退出旧实例，服务随之重启）
+  再退出旧实例，服务随之重启）；版本行只报 `dsh <版本>`，不带运行状态
 - **保持唤醒**：启动即阻止系统睡眠（`SetThreadExecutionState`），后台任务不会被睡眠打断；
   不阻止息屏、不影响锁屏，退出时自动恢复系统默认睡眠策略
 - **插件管理器**：托盘 →「插件管理器」，绿灯启用 / 红灯关闭，下面一个「重启服务并生效」
+- **版本管理器**：托盘 →「版本管理器」，预览远端最近 10 个版本（**含 alpha** 等预发布），
+  每个版本下载到**独立槽位**（`runtime\slots\<版本>\`，约 220 MB/个，互不覆盖），
+  下载过的版本**秒级来回切换**：切换前必弹**窗口内确认**，确认后**自动重启应用**。
+  槽位数超过上限（默认 5）**只在页面里提示**（非弹窗），并给「去清理」跳转按钮。
+  托盘**没有**「检查更新」和「选源」入口 —— 检查/下载/切换/删除**和换 npm 源**
+  全在版本管理器里（换源用窗口顶部的下拉框：npmmirror / 华为云 / 腾讯云 / 跟随系统）
 - **插件自动加载**：启动时按启用状态把 exe 同目录 `plugins/` 里的插件装进 dsh
   （`~/.dsh/profiles/web/`），关掉的就撤下来，不用手工改 dsh 的配置
-- **一键更新**：托盘 →「检查更新（npm）」，自动执行
-  `停止服务 → npm install @deepseek-ai/dsh@latest → 重启服务 → 重载界面`
-- **默认走国内镜像**（`registry.npmmirror.com`），托盘菜单可在镜像 / 跟随系统之间切换
+- **默认走国内镜像**（`registry.npmmirror.com`）：首次安装时在启动页三选一，
+  之后下载/检查更新都沿用它（配置在 `config.json` 的 `registry`；
+  日常换源走版本管理器窗口顶部的下拉框，托盘不提供入口）
 
 ## 目录结构
 
 ```
 src/                         代码（含构建、打包、自测）
-├── dsh_shell.py             主程序（服务管理 / WebView2 / 托盘 / 更新 / 插件同步 / 两个界面）
+├── dsh_shell.py             主程序（服务管理 / WebView2 / 托盘 / 版本槽位 / 插件同步 / 三个界面）
 ├── app_icon.py              运行时绘制图标，无外部资源依赖
 ├── build.py                 一键打包入口
 ├── assets/app.ico           打包用的图标（缺了 build.py 会按 app_icon.py 重新生成）
 ├── packaging/*.spec         PyInstaller 打包配置
 ├── runtime/dsh_fastboot.mjs 启动加速补丁（node --import 注入，不改 dsh 文件）
 └── tools/                   自测脚本
-    ├── probe_service.py         服务层：安装 / 启动 / 健康检查 / 更新 / 停止
+    ├── probe_service.py           服务层：安装 / 启动 / 健康检查 / 停止
     ├── probe_auth.py            鉴权链路：401 → 303 + Set-Cookie → 200
     ├── probe_gui.py             GUI + 托盘：发 WM_CLOSE，确认收进托盘且进程存活
-    ├── probe_update.py          npm 更新动作
+    ├── probe_update.py          多槽位版本链路：远端列表（含 alpha）/ 下载 / 占用
+    ├── probe_version_manager.py 版本管理器窗口 + js_api 桥 + 切换确认框
     ├── probe_plugins.py         插件同步：扫描 → 镜像进 dsh → 重写托管补丁块
     └── probe_plugin_manager.py  插件管理器窗口 + js_api 桥 + 红绿灯渲染
 
@@ -93,7 +100,9 @@ dist/                        整个目录就是程序目录
   Node —— `PATH` 里找 `node`，再找常见安装位置（此时才需要 **Node.js 18+**）
 
 首次启动会自动在数据目录里 `npm install @deepseek-ai/dsh`（依赖约 520 个包、
-2.3 万个文件，首次需要几分钟，之后走缓存会快很多）。
+2.3 万个文件，首次需要几分钟，之后走缓存会快很多），装进第一个版本槽位
+`runtime\slots\<版本>\`；老版本的单目录布局（`runtime\node_modules\`）会在下次
+启动时**原地 rename 迁移**成槽位（同卷瞬间完成，不重下、不丢版本）。
 
 ## 数据目录
 
@@ -104,10 +113,11 @@ dist/                        整个目录就是程序目录
 
 | 路径 | 说明 | 丢了会怎样 |
 | --- | --- | --- |
-| `runtime/` | dsh 的 npm 安装目录（更新就是更新这里，约 220 MB） | 首次启动重新 `npm install`，几分钟 |
+| `runtime/slots/<版本>/` | dsh 的版本槽位，一个版本一个完整 npm 工程根（各约 220 MB，可并存多个，下载/切换都在这里） | 需要的版本重新下载（走 npm 缓存会快很多） |
+| `runtime/` | 槽位的父目录；老布局残留会在此被自动迁移进 `slots/` | 同上 |
 | `workspace/` | dsh 启动时的工作目录 | 里面放过东西的话就没了 |
 | `webview/` | WebView2 用户数据（Cookie、localStorage） | 界面偏好重置；登录态由下面的 `.dsh` 决定 |
-| `config.json` | 配置，`registry` 字段控制 npm 源，留空表示跟随系统 npm 配置 | 回到默认（国内镜像） |
+| `config.json` | 配置：`registry`（npm 源，留空=跟随系统）、`activeSlot`（当前活动版本）、`maxSlots`（槽位上限，默认 5）、`versionsCache`（远端版本列表缓存） | 回到默认（国内镜像），活动版本按本地槽位自动探测 |
 | `plugins.json` | 插件启用状态（插件管理器写，红灯/绿灯就是它） | 所有插件回到默认「开启」 |
 | `data/usage.json` | usage 插件的 token 账本 | 用量统计清零（从零开始记） |
 | `shell.log` / `service.log` / `stdio.log` | 日志 | 无影响 |

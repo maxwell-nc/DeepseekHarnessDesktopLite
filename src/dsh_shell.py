@@ -8,7 +8,8 @@ DeepSeek Harness 桌面壳
 * 用 **WebView2**（Edge Chromium）内核内嵌界面，不依赖外部浏览器
 * 后台静默拉起 ``dsh web`` 服务，**全程不出现任何命令行窗口**
 * 常驻**系统托盘**，点窗口关闭按钮只收起界面，服务继续在后台运行
-* 托盘菜单一键**更新**：停止服务 -> ``npm install @deepseek-ai/dsh@latest`` -> 重启服务
+* **版本管理器**：预览远端最近 10 个版本（含 alpha），每个版本下载到独立槽位
+  （``runtime/slots/<版本>/``），确认后切换 —— 切换自动重启应用，多版本并存不互相覆盖
 """
 
 import http.cookiejar
@@ -752,6 +753,391 @@ def effective_registry():
 
 
 # --------------------------------------------------------------------------- #
+# 版本槽位：多版本并存的运行时布局（版本管理器的地基）
+#
+# 老布局（单目录原地覆盖）：runtime/node_modules/@deepseek-ai/dsh
+# 新布局：
+#     runtime/slots/<版本>/            每个版本一个完整 npm 工程根
+#     runtime/slots/<版本>.dl/          下载中的临时目录，装完 rename 成正式槽位
+# 活动版本记在 config.activeSlot；切换 = 改它 + 自动重启应用（见 vm_switch）。
+# workspace/ 插件/ 配置全都不分版本，所有槽位共享。
+# ---------------------------------------------------------------------------
+
+SLOTS_DIR = os.path.join(RUNTIME_DIR, "slots")
+SLOT_DL_SUFFIX = ".dl"
+# 首次安装时还不知道装的是哪个版本，临时目录先叫这个（同刻只允许一个 npm 任务）
+SLOT_PENDING_NAME = "_pending"
+DEFAULT_MAX_SLOTS = 5            # 槽位数上限（超限只提示 + 跳转按钮，不自动删）
+VERSION_LIST_LIMIT = 10           # 远端版本列表展示条数（含 alpha）
+VERSIONS_CACHE_TTL = 600.0        # 远端版本列表内存缓存（秒）
+
+_SCOPE, _NAME = PACKAGE.split("/") if "/" in PACKAGE else ("", PACKAGE)
+
+
+def sanitize_version(ver):
+    """版本号 -> 安全的目录名；不合法返回 None（防路径穿越）。"""
+    ver = str(ver or "").strip()
+    if not ver or len(ver) > 64:
+        return None
+    if not re.match(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$", ver):
+        return None
+    if ".." in ver or "/" in ver or "\\" in ver:
+        return None
+    return ver
+
+
+def slot_dir(version):
+    """某版本的槽位目录（不存在也返回路径）。"""
+    ver = sanitize_version(version)
+    if not ver:
+        raise ValueError("非法版本号: %r" % (version,))
+    return os.path.join(SLOTS_DIR, ver)
+
+
+def _version_sort_key(ver):
+    """够用的简化 semver 排序键：1.5.0-alpha.4 < 1.5.0（同号时正式版更大）。"""
+    parts = []
+    for chunk in re.split(r"[.\-+_]", str(ver)):
+        if not chunk:
+            continue
+        parts.append((0, int(chunk)) if chunk.isdigit() else (1, chunk.lower()))
+    if "-" not in str(ver):
+        parts.append((2, ""))       # 没有预发布段 = 正式版，压过同号 prerelease
+    return parts
+
+
+def _read_package_version(manifest):
+    """读一个 package.json 的 version（带白名单校验）；读不到返回 None。"""
+    try:
+        with open(manifest, "r", encoding="utf-8") as fh:
+            return sanitize_version(json.load(fh).get("version"))
+    except (OSError, ValueError):
+        return None
+
+
+def legacy_layout_version():
+    """老单目录布局里装的版本号；没有老布局返回 None。"""
+    return _read_package_version(
+        os.path.join(RUNTIME_DIR, "node_modules", _SCOPE, _NAME, "package.json")
+    )
+
+
+def list_local_slots(include_partial=False):
+    """扫描 slots/，返回 [{version, dir, partial}]；partial = 下载中的 *.dl。"""
+    out = []
+    if not os.path.isdir(SLOTS_DIR):
+        return out
+    try:
+        names = sorted(os.listdir(SLOTS_DIR))
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(SLOTS_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        partial = name.endswith(SLOT_DL_SUFFIX)
+        if partial and not include_partial:
+            continue
+        base = name[: -len(SLOT_DL_SUFFIX)] if partial else name
+        if partial:
+            ver = sanitize_version(base) or base
+        else:
+            ver = (
+                _read_package_version(
+                    os.path.join(path, "node_modules", _SCOPE, _NAME, "package.json")
+                )
+                or (sanitize_version(base) or base)
+            )
+        out.append({"version": ver, "dir": path, "partial": partial})
+    return out
+
+
+_slot_size_cache = {}     # 目录 -> (记录时间, MB)
+
+
+def slot_size_mb(path, max_age=60.0):
+    """槽位占用（MB）。os.walk 不便宜，结果缓存 60 秒（删槽位时手动失效）。"""
+    now = time.time()
+    hit = _slot_size_cache.get(path)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    total = 0
+    for _base, _dirs, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(_base, name))
+            except OSError:
+                pass
+    mb = int(round(total / 1048576.0))
+    _slot_size_cache[path] = (now, mb)
+    return mb
+
+
+def active_slot_version():
+    """当前活动版本：config.activeSlot → 本地最高版本 → 老布局版本 → None。"""
+    want = sanitize_version(load_config().get("activeSlot"))
+    slots = [s for s in list_local_slots() if not s["partial"]]
+    versions = {s["version"] for s in slots}
+    if want and want in versions:
+        return want
+    if slots:
+        return max(versions, key=_version_sort_key)
+    legacy = legacy_layout_version()
+    if legacy:
+        return legacy
+    return None
+
+
+def active_slot_dir():
+    """活动版本所在目录；老布局（迁移没跑成）回退 RUNTIME_DIR，未安装也回它。"""
+    ver = active_slot_version()
+    if ver:
+        path = slot_dir(ver)
+        if _read_package_version(
+            os.path.join(path, "node_modules", _SCOPE, _NAME, "package.json")
+        ):
+            return path
+    if legacy_layout_version():
+        return RUNTIME_DIR          # 老单目录布局继续可用（只是没法多版本）
+    slots = [s for s in list_local_slots() if not s["partial"]]
+    if slots:
+        return max(slots, key=lambda s: _version_sort_key(s["version"]))["dir"]
+    return RUNTIME_DIR
+
+
+def set_active_slot(version):
+    """把活动版本写进 config.json（version 为空 = 清除，回落到自动探测）。"""
+    ver = sanitize_version(version)
+    cfg = load_config()
+    cfg["activeSlot"] = ver or ""
+    save_config(cfg)
+
+
+def max_slots():
+    """槽位数上限（config.maxSlots > 0 时用它，否则默认值）。"""
+    try:
+        value = int(load_config().get("maxSlots") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else DEFAULT_MAX_SLOTS
+
+
+def migrate_legacy_runtime():
+    """老单目录布局 -> slots/<版本>/。幂等，启动早期调一次（服务还没起）。
+
+    同一卷 rename，220MB 也是瞬间完成；搬一半失败就把搬过去的挪回去，
+    保持老布局可用（active_slot_dir() 会兜住老布局）。
+    """
+    legacy_ver = legacy_layout_version()
+    if not legacy_ver:
+        return False                        # 没有老布局（已迁移过 / 全新安装）
+    if list_local_slots(include_partial=True):
+        return False                        # slots/ 已有内容，老目录当残留，不动
+    dest = slot_dir(legacy_ver)
+    if os.path.exists(dest):
+        return False
+    try:
+        os.makedirs(SLOTS_DIR, exist_ok=True)
+        os.makedirs(dest)
+    except OSError as exc:
+        log("创建槽位目录失败（继续按老布局运行）: %s" % exc)
+        return False
+    moved = []
+    try:
+        for name in ("node_modules", "package.json", "package-lock.json", ".package-lock.json"):
+            src = os.path.join(RUNTIME_DIR, name)
+            if os.path.exists(src):
+                shutil.move(src, os.path.join(dest, name))
+                moved.append(name)
+    except Exception as exc:  # noqa: BLE001
+        log("旧布局迁移中断，回滚: %s" % exc)
+        for name in moved:
+            try:
+                shutil.move(os.path.join(dest, name), os.path.join(RUNTIME_DIR, name))
+            except OSError as back_exc:
+                log("回滚 %s 失败: %s" % (name, back_exc))
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
+        return False
+    set_active_slot(legacy_ver)
+    log("旧布局已迁移到槽位: %s（dsh %s）" % (dest, legacy_ver))
+    return True
+
+
+def cleanup_partial_slots():
+    """清掉上次异常退出留下的 *.dl 半成品（启动早期调）。"""
+    for slot in list_local_slots(include_partial=True):
+        if not slot["partial"]:
+            continue
+        try:
+            shutil.rmtree(slot["dir"])
+            log("已清理下载残留: %s" % slot["dir"])
+        except OSError as exc:
+            log("清理下载残留失败 %s: %s" % (slot["dir"], exc))
+
+
+def _channel_of(ver, tags):
+    """给版本打通道标签：stable / alpha / beta / rc / 具体 tag 名。"""
+    for tag, target in (tags or {}).items():
+        if str(target) == str(ver):
+            return "stable" if str(tag) == "latest" else str(tag)
+    match = re.search(r"-([0-9A-Za-z]+)", str(ver))
+    if match:
+        pre = match.group(1).lower()
+        for name in ("alpha", "beta", "rc", "next", "canary"):
+            if pre.startswith(name):
+                return name
+        return pre
+    return "stable"
+
+
+def _run_npm_capture(args, cwd=None, timeout=90.0):
+    """跑一条 npm 命令并收集输出（npm view 之类的一次性查询）。返回 (ok, text)。"""
+    node_exe = find_node()
+    if not node_exe:
+        return False, "未检测到可用的 Node.js"
+    registry = effective_registry()
+    npm_cli = find_npm_cli(node_exe)
+    if npm_cli:
+        cmd = [node_exe, npm_cli]
+    else:
+        npm_cmd = os.path.join(os.path.dirname(node_exe), "npm.cmd")
+        if not os.path.isfile(npm_cmd):
+            npm_cmd = shutil.which("npm") or "npm"
+        cmd = ["cmd.exe", "/c", npm_cmd]
+    cmd += list(args)
+    if registry:
+        cmd.append("--registry=%s" % registry)
+    log("npm: %s" % " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd or RUNTIME_DIR,
+            env=DshService._child_env(node_exe, registry),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        return False, "启动 npm 失败：%s" % exc
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc.pid)
+        return False, "npm 超时（%d 秒）" % int(timeout)
+    out = out or ""
+    return proc.returncode == 0, out
+
+
+def _build_version_rows(data):
+    """npm view 的 {versions, time, dist-tags} -> 按发布时间倒序的前 N 条。"""
+    times = data.get("time") or {}
+    tags = data.get("dist-tags") or data.get("distTags") or {}
+    rows = []
+    for ver, published in times.items():
+        if ver in ("created", "modified"):
+            continue
+        version = sanitize_version(ver)
+        if not version:
+            continue
+        rows.append(
+            {
+                "version": version,
+                "channel": _channel_of(version, tags),
+                "publishedAt": str(published or ""),
+            }
+        )
+    rows.sort(
+        key=lambda r: (r["publishedAt"], _version_sort_key(r["version"])), reverse=True
+    )
+    return rows[:VERSION_LIST_LIMIT]
+
+
+_versions_cache = {"at": 0.0, "result": None}
+
+
+def fetch_remote_versions(force=False):
+    """最近 VERSION_LIST_LIMIT 个版本（含 alpha），按发布时间倒序。
+
+    成功结果同时写进内存缓存和 config.versionsCache（离线兜底）。
+    返回 {ok, stale, checkedAt, error, rows}。
+    """
+    now = time.time()
+    memory = _versions_cache.get("result")
+    if not force and memory and now - _versions_cache["at"] < VERSIONS_CACHE_TTL:
+        return memory
+
+    ok, text = _run_npm_capture(
+        [
+            "view",
+            PACKAGE,
+            "versions",
+            "time",
+            "dist-tags",
+            "--json",
+            "--loglevel=error",
+            "--fetch-retries=1",
+            "--fetch-retry-maxtimeout=15000",
+        ]
+    )
+    rows, error = None, None
+    if ok:
+        try:
+            rows = _build_version_rows(json.loads(text))
+        except (ValueError, TypeError) as exc:
+            error = "解析 npm view 输出失败: %s" % exc
+    else:
+        error = (text or "").strip()[-300:] or "npm view 执行失败"
+
+    if rows is not None:
+        result = {"ok": True, "stale": False, "checkedAt": now, "error": "", "rows": rows}
+        _versions_cache["at"] = now
+        _versions_cache["result"] = result
+        cfg = load_config()
+        cfg["versionsCache"] = {"at": now, "rows": rows}
+        save_config(cfg)
+        return result
+
+    # 失败：内存缓存 → 磁盘缓存 → 空列表，都带上错误原因
+    if memory:
+        return dict(memory, stale=True, error=error)
+    disk = load_config().get("versionsCache") or {}
+    if isinstance(disk, dict) and disk.get("rows"):
+        return {
+            "ok": False,
+            "stale": True,
+            "checkedAt": disk.get("at") or 0,
+            "error": error,
+            "rows": disk["rows"],
+        }
+    return {"ok": False, "stale": False, "checkedAt": 0, "error": error, "rows": []}
+
+
+def cached_remote_versions():
+    """只读缓存的远端版本列表（不打 npm）；给轮询用，保证 state() 不阻塞。"""
+    memory = _versions_cache.get("result")
+    if memory:
+        return memory
+    disk = load_config().get("versionsCache") or {}
+    if isinstance(disk, dict) and disk.get("rows"):
+        return {
+            "ok": False,
+            "stale": True,
+            "checkedAt": disk.get("at") or 0,
+            "error": "",
+            "rows": disk["rows"],
+        }
+    return {"ok": False, "stale": False, "checkedAt": 0, "error": "", "rows": []}
+
+
+# --------------------------------------------------------------------------- #
 # 插件：目录 / 状态 / 同步
 #
 # 插件包放在 **exe 同目录的 plugins/**，一个插件一个子目录，里面必须有 manifest.json。
@@ -834,9 +1220,12 @@ def fastboot_script():
 
 
 def client_modules_entry():
-    """dsh-client-modules 的入口文件，补丁要拿它的原型打洞。"""
+    """dsh-client-modules 的入口文件，补丁要拿它的原型打洞。
+
+    按**活动槽位**解析 —— 切换版本后节点目录跟着换，补丁不能打到旧槽位上。
+    """
     return os.path.join(
-        RUNTIME_DIR, "node_modules", "@deepseek-ai", "dsh-client-modules", "lib", "index.js"
+        active_slot_dir(), "node_modules", "@deepseek-ai", "dsh-client-modules", "lib", "index.js"
     )
 
 
@@ -1449,7 +1838,8 @@ class DshService(object):
 
     @property
     def package_dir(self):
-        return os.path.join(RUNTIME_DIR, "node_modules", "@deepseek-ai", "dsh")
+        """活动槽位里的 dsh 包目录（多版本布局见「版本槽位」一节）。"""
+        return os.path.join(active_slot_dir(), "node_modules", _SCOPE, _NAME)
 
     def installed_version(self):
         manifest = os.path.join(self.package_dir, "package.json")
@@ -1502,10 +1892,13 @@ class DshService(object):
         return env
 
     @staticmethod
-    def ensure_runtime_manifest():
-        manifest = os.path.join(RUNTIME_DIR, "package.json")
+    def ensure_runtime_manifest(target_dir=None):
+        """给一个 npm 工程根补 package.json（缺才写）。默认 = 活动槽位目录。"""
+        target_dir = target_dir or active_slot_dir()
+        manifest = os.path.join(target_dir, "package.json")
         if not os.path.isfile(manifest):
             try:
+                os.makedirs(target_dir, exist_ok=True)
                 with open(manifest, "w", encoding="utf-8") as fh:
                     json.dump(
                         {
@@ -1518,11 +1911,65 @@ class DshService(object):
                         indent=2,
                     )
             except OSError as exc:
-                log("写入 runtime/package.json 失败: %s" % exc)
+                log("写入 %s 失败: %s" % (manifest, exc))
 
     # ---------------- 安装 / 更新 ---------------- #
 
-    def npm_install(self, spec, on_line=None):
+    def npm_install(self, spec, on_line=None, cwd=None):
+        """执行 npm install spec，装进 cwd（默认活动槽位），返回 (是否成功, 末尾输出)。"""
+        target = cwd or active_slot_dir()
+        self.ensure_runtime_manifest(target)
+        return self._run_npm_install(spec, target, on_line)
+
+    def install_to_slot(self, spec, expected_version=None, on_line=None):
+        """把 spec 装进一个**新槽位**：先 <名>.dl，装完按实际版本 rename。
+
+        活动槽位永远不被碰 —— 下载失败/中断只留下可清理的 .dl 目录，
+        现有版本照常可用。返回 (是否成功, 实际版本 or None, 末尾输出)。
+        """
+        hint = sanitize_version(expected_version)
+        tmp = os.path.join(SLOTS_DIR, (hint or SLOT_PENDING_NAME) + SLOT_DL_SUFFIX)
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)      # 上次残留
+        try:
+            os.makedirs(SLOTS_DIR, exist_ok=True)
+        except OSError as exc:
+            return False, None, "创建槽位目录失败：%s" % exc
+        self.ensure_runtime_manifest(tmp)
+        ok, tail = self._run_npm_install(spec, tmp, on_line)
+        if not ok:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False, None, tail
+        actual = _read_package_version(
+            os.path.join(tmp, "node_modules", _SCOPE, _NAME, "package.json")
+        )
+        if not actual:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False, None, "装完了但读不到 %s 的版本号" % PACKAGE
+        if hint and actual != hint:
+            log("装到的版本 %s 与请求的 %s 不一致，以实际版本为准" % (actual, hint))
+        final = slot_dir(actual)
+        if os.path.isdir(final):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False, actual, "该版本已下载：%s" % final
+        try:
+            os.rename(tmp, final)
+        except OSError as exc:
+            return False, actual, "槽位落位失败（%s -> %s）：%s" % (tmp, final, exc)
+        log("槽位就绪: %s" % final)
+        return True, actual, tail
+
+    def download_version(self, version, on_line=None):
+        """下载某个具体版本到新槽位（已下载直接拒绝，绝不覆盖）。"""
+        ver = sanitize_version(version)
+        if not ver:
+            return False, "版本号不合法：%r" % (version,)
+        if os.path.isdir(slot_dir(ver)):
+            return False, "该版本已下载：%s" % slot_dir(ver)
+        ok, _actual, tail = self.install_to_slot("%s@%s" % (PACKAGE, ver), ver, on_line)
+        return ok, tail
+
+    def _run_npm_install(self, spec, cwd, on_line=None):
         """执行 npm install，返回 (是否成功, 末尾输出)。"""
         node_exe = find_node()
         if not node_exe:
@@ -1556,15 +2003,16 @@ class DshService(object):
         if registry:
             cmd.append("--registry=%s" % registry)
 
-        self.ensure_runtime_manifest()
         log("npm: %s" % " ".join(cmd))
         log("npm registry: %s" % (registry or "(跟随系统 npm 配置)"))
+        log("npm cwd: %s" % cwd)
         if on_line is not None:
-            on_line("$ npm install %s\nregistry: %s" % (spec, registry or "系统默认"))
+            on_line("$ npm install %s\nregistry: %s\ncwd: %s"
+                    % (spec, registry or "系统默认", cwd))
         try:
             proc = subprocess.Popen(
                 cmd,
-                cwd=RUNTIME_DIR,
+                cwd=cwd,
                 env=self._child_env(node_exe, registry),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -1719,7 +2167,7 @@ class DshService(object):
             log("读取服务输出异常: %s" % exc)
 
     def stop_npm_install(self):
-        """终止还在跑的首次安装 npm 进程树（用户在安装中途退出时调用）。"""
+        """终止还在跑的 npm 进程树（首装/下载中途取消，或用户中途退出时调用）。"""
         with self._lock:
             proc = self._npm_proc
             self._npm_proc = None
@@ -2043,6 +2491,479 @@ MANAGER_HTML = """<!doctype html>
 """
 
 
+# 版本管理器窗口：预览远端最近 N 个版本（含 alpha）、下载到独立槽位、
+# 确认后切换（自动重启应用）、删除多余槽位。样式沿用 MANAGER_HTML 的亮色主题。
+VERSION_MANAGER_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>版本管理器</title>
+<style>
+  :root {
+    --bg: #f4f6fb;
+    --panel: #ffffff;
+    --panel2: #f7f9fe;
+    --line: rgba(22, 32, 58, .10);
+    --fg: #1b2130;
+    --dim: #6b7488;
+    --accent: #4d6bfe;
+    --on: #119e6a;
+    --off: #d63c4c;
+    --warn: #a8660d;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 13px; display: flex; flex-direction: column;
+    -webkit-user-select: none; user-select: none;
+  }
+  header {
+    padding: 16px 22px 12px; border-bottom: 1px solid var(--line);
+    background: var(--panel); display: flex; align-items: flex-start; gap: 14px;
+  }
+  header .head { flex: 1; min-width: 0; }
+  h1 { margin: 0 0 6px; font-size: 16px; font-weight: 600; letter-spacing: .2px; }
+  .paths { font-size: 11px; color: var(--dim); line-height: 1.7; word-break: break-all; }
+  .paths b { color: #47506a; font-weight: 500; }
+  .paths select {
+    font: inherit; font-size: 11px; color: #47506a;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel2); padding: 1px 5px; cursor: pointer;
+    max-width: 220px;
+  }
+  .paths select:hover { border-color: rgba(22, 32, 58, .26); }
+  .hbtns { display: flex; gap: 8px; flex: 0 0 auto; }
+  .quota {
+    display: none; align-items: center; gap: 10px;
+    margin: 12px 18px 0; padding: 9px 13px;
+    background: rgba(255, 244, 214, .7); border: 1px solid rgba(166, 102, 0, .38);
+    border-radius: 10px; color: #8a5a00; font-size: 12px; line-height: 1.6;
+  }
+  .quota.show { display: flex; }
+  .quota button {
+    margin-left: auto; flex: 0 0 auto;
+    background: #fff; color: #8a5a00; border: 1px solid rgba(166, 102, 0, .45);
+    border-radius: 8px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+  }
+  .quota button:hover { background: #fff8e8; }
+  main { flex: 1; overflow-y: auto; padding: 12px 18px 16px; }
+  .row {
+    display: flex; align-items: flex-start; gap: 14px;
+    padding: 12px 15px; margin-bottom: 10px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(22, 32, 58, .04);
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .row:hover { background: var(--panel2); }
+  .row.active { border-color: rgba(77, 107, 254, .45); box-shadow: 0 0 0 1px rgba(77, 107, 254, .18); }
+  .row.downloading { border-color: rgba(17, 158, 106, .45); }
+  .meta { flex: 1; min-width: 0; }
+  .title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .title .ver { font-size: 13.5px; font-weight: 600; font-family: Consolas, monospace; }
+  .chip {
+    font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--dim); background: var(--panel2);
+    white-space: nowrap;
+  }
+  .chip.on-now { color: var(--accent); border-color: rgba(77, 107, 254, .45); background: rgba(77, 107, 254, .10); }
+  .chip.have { color: var(--on); border-color: rgba(17, 158, 106, .38); background: rgba(17, 158, 106, .08); }
+  .chip.stable { color: var(--on); border-color: rgba(17, 158, 106, .35); }
+  .chip.alpha, .chip.beta, .chip.rc, .chip.next, .chip.canary {
+    color: #8a5a00; border-color: rgba(166, 102, 0, .42); background: rgba(255, 244, 214, .6);
+  }
+  .sub { margin-top: 5px; font-size: 11.5px; color: var(--dim); line-height: 1.6; }
+  .acts { display: flex; gap: 8px; flex: 0 0 auto; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  button.primary {
+    background: linear-gradient(135deg, #4d6bfe 0%, #3a54d8 100%);
+    color: #fff; border: none; border-radius: 8px; padding: 7px 15px;
+    font-size: 12.5px; font-weight: 600; cursor: pointer;
+  }
+  button.primary:hover { filter: brightness(1.08); }
+  button.ghost {
+    background: #fff; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+  }
+  button.ghost:hover { color: var(--fg); border-color: rgba(22, 32, 58, .26); }
+  button.danger { color: var(--off); }
+  button:disabled { opacity: .45; cursor: default; pointer-events: none; }
+  .progress {
+    margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+    background: rgba(77, 107, 254, .06); border: 1px solid rgba(77, 107, 254, .18);
+    font-size: 11.5px; color: #47506a; line-height: 1.6;
+  }
+  .progress .bar {
+    height: 4px; margin: 6px 0; border-radius: 999px; overflow: hidden;
+    background: rgba(77, 107, 254, .15);
+  }
+  .progress .bar i {
+    display: block; height: 100%; width: 40%;
+    background: linear-gradient(90deg, #4d6bfe, #7a90ff, #4d6bfe);
+    background-size: 200% 100%; animation: slide 1.2s linear infinite;
+  }
+  @keyframes slide { from { background-position: 0 0; } to { background-position: 200% 0; } }
+  .progress .tail { font-family: Consolas, monospace; color: var(--dim); word-break: break-all; }
+  .empty { color: var(--dim); text-align: center; padding: 40px 10px; line-height: 1.9; }
+  footer {
+    border-top: 1px solid var(--line); padding: 10px 18px 12px;
+    background: #eef1f8; font-size: 12px; color: var(--dim); line-height: 1.6;
+  }
+  #status.busy { color: var(--warn); }
+  #status.ok { color: var(--on); }
+  #status.err { color: var(--off); }
+  /* 窗口内确认框（不是系统弹窗）：所有切换都必须先过它 */
+  #mask {
+    display: none; position: fixed; inset: 0; z-index: 20;
+    background: rgba(22, 32, 58, .38); align-items: center; justify-content: center;
+  }
+  #mask.show { display: flex; }
+  #dialog {
+    width: 420px; max-width: 90%; background: #fff; border-radius: 14px;
+    padding: 20px 22px 16px; box-shadow: 0 12px 40px rgba(22, 32, 58, .25);
+  }
+  #dialog h2 { margin: 0 0 10px; font-size: 15px; }
+  #dialog .body { font-size: 12.5px; color: #47506a; line-height: 1.8; }
+  #dialog .body b { font-family: Consolas, monospace; }
+  #dialog .btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+  /* 重启遮罩 */
+  #restarting {
+    display: none; position: fixed; inset: 0; z-index: 30;
+    background: rgba(244, 246, 251, .96); flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; color: var(--dim);
+  }
+  #restarting.show { display: flex; }
+  #restarting .big { font-size: 15px; color: var(--fg); font-weight: 600; }
+  .spin {
+    width: 26px; height: 26px; border-radius: 50%;
+    border: 3px solid rgba(77, 107, 254, .2); border-top-color: var(--accent);
+    animation: turn .8s linear infinite;
+  }
+  @keyframes turn { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <header>
+    <div class="head">
+      <h1>版本管理器</h1>
+      <div class="paths">
+        当前版本 <b id="p-installed">…</b>
+        ｜服务 <b id="p-running">…</b><br>
+        活动槽位 <b id="p-slots">…</b><br>
+        npm 源 <select id="p-registry" title="下载 / 检查更新走哪个源；托盘不再提供换源入口"></select>
+        ｜已下载 <b id="p-count">…</b>｜共占用 <b id="p-size">…</b>
+      </div>
+    </div>
+    <div class="hbtns">
+      <button class="ghost" id="btn-refresh">刷新</button>
+      <button class="ghost" id="btn-slots-dir">打开槽位目录</button>
+    </div>
+  </header>
+
+  <div class="quota" id="quota">
+    <span id="quota-text">…</span>
+    <button id="btn-clean">去清理</button>
+  </div>
+
+  <main id="list"><div class="empty">正在读取…</div></main>
+
+  <footer>
+    <span id="status">下载会进独立文件夹，互不覆盖；切换前会先确认，确认后自动重启应用。</span>
+  </footer>
+
+  <div id="mask">
+    <div id="dialog">
+      <h2 id="dlg-title">确认切换</h2>
+      <div class="body" id="dlg-body"></div>
+      <div class="btns">
+        <button class="ghost" id="dlg-cancel">取消</button>
+        <button class="primary" id="dlg-ok">切换并重启</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="restarting">
+    <div class="spin"></div>
+    <div class="big">正在重启应用…</div>
+    <div>新实例会按所选版本启动，稍候片刻。</div>
+  </div>
+
+<script>
+  var api = null;
+  var last = null;
+  var pendingSwitch = null;      // 确认框里待切换的版本
+  var pendingRemove = null;      // 确认框里待删除的版本
+  var restarting = false;
+
+  var CHANNELS = {
+    stable: '稳定', alpha: 'alpha', beta: 'beta', rc: 'rc',
+    next: 'next', canary: 'canary'
+  };
+
+  function esc(text) {
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function setStatus(text, kind) {
+    var el = document.getElementById('status');
+    el.textContent = text || '';
+    el.className = kind || '';
+  }
+
+  function fmtDate(iso) {
+    if (typeof iso === 'number' && iso > 0) {       // 毫秒时间戳
+      try { return new Date(iso).toISOString().slice(0, 10); } catch (e) { return ''; }
+    }
+    var s = String(iso || '');
+    return s ? s.slice(0, 10) : '';
+  }
+
+  function fmtMB(mb) {
+    if (mb == null) return '';
+    if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+    return mb + ' MB';
+  }
+
+  function channelChip(row) {
+    var ch = row.channel || 'stable';
+    var label = CHANNELS[ch] || ch;
+    return '<span class="chip ' + esc(ch) + '">' + esc(label) + '</span>';
+  }
+
+  function rowHtml(row, state) {
+    var busy = !!state.busy;
+    var task = state.task;
+    var cls = 'row' + (row.active ? ' active' : '');
+    var downloading = task && task.running && task.version === row.version;
+    if (downloading) cls += ' downloading';
+
+    var chips = channelChip(row);
+    if (row.active) chips += '<span class="chip on-now">当前使用</span>';
+    if (row.installed && !row.active) chips += '<span class="chip have">已下载 ' + fmtMB(row.sizeMB) + '</span>';
+    if (!row.installed) chips += '<span class="chip">未下载</span>';
+    if (row.source === 'local-only') chips += '<span class="chip">仅本机</span>';
+
+    var sub = [];
+    if (row.publishedAt) sub.push('发布于 ' + fmtDate(row.publishedAt));
+    if (row.installed && row.sizeMB != null) sub.push(fmtMB(row.sizeMB));
+
+    var acts = '';
+    if (downloading) {
+      acts = '<button class="ghost" data-act="cancel" data-ver="' + esc(row.version) + '"' + (busy ? '' : ' disabled') + '>取消</button>';
+    } else if (!row.installed) {
+      acts = '<button class="primary" data-act="download" data-ver="' + esc(row.version) + '"' + (busy ? ' disabled' : '') + '>下载</button>';
+    } else {
+      if (!row.active) {
+        acts += '<button class="primary" data-act="switch" data-ver="' + esc(row.version) + '"' + (busy ? ' disabled' : '') + '>切换</button>';
+        acts += '<button class="ghost danger" data-act="remove" data-ver="' + esc(row.version) + '"' + (busy ? ' disabled' : '') + '>删除</button>';
+      }
+      acts += '<button class="ghost" data-act="dir" data-ver="' + esc(row.version) + '">打开目录</button>';
+    }
+
+    var progress = '';
+    if (downloading) {
+      var tail = (task.tail && task.tail.length) ? task.tail[task.tail.length - 1] : '';
+      progress = '<div class="progress">'
+        + '<span>' + esc(task.phase || '下载中') + ' · 已用时 ' + (task.elapsed || 0) + ' 秒</span>'
+        + '<div class="bar"><i></i></div>'
+        + '<div class="tail">' + esc(tail) + '</div>'
+        + '</div>';
+    }
+
+    return '<div class="' + cls + '" data-row="' + esc(row.version) + '">'
+      + '<div class="meta">'
+      + '<div class="title"><span class="ver">' + esc(row.version) + '</span>' + chips + '</div>'
+      + (sub.length ? '<div class="sub">' + esc(sub.join(' ｜ ')) + '</div>' : '')
+      + progress
+      + '</div>'
+      + '<div class="acts">' + acts + '</div>'
+      + '</div>';
+  }
+
+  // npm 源下拉框：选项来自 state.registryChoices + 跟随系统；
+  // 配置里存着自定义源时也补一个选项，保证当前值始终选得中。
+  function fillRegistry(state) {
+    var sel = document.getElementById('p-registry');
+    if (!sel) return;
+    var choices = (state.registryChoices || []).slice();
+    var url = state.registryUrl || '';
+    if (url && !choices.some(function (c) { return c.url === url; })) {
+      choices.push({ label: state.registry || url, url: url });
+    }
+    choices.push({ label: '跟随系统', url: '' });
+    var sig = choices.map(function (c) { return c.url + '' + c.label; }).join('');
+    if (sel.getAttribute('data-sig') !== sig) {
+      sel.innerHTML = choices.map(function (c) {
+        return '<option value="' + esc(c.url) + '">' + esc(c.label) + '</option>';
+      }).join('');
+      sel.setAttribute('data-sig', sig);
+    }
+    if (sel.value !== url) sel.value = url;
+  }
+
+  function render(state) {
+    last = state;
+    document.getElementById('p-installed').textContent = state.installedVersion || '未安装';
+    document.getElementById('p-running').textContent = state.serviceRunning ? '运行中' : '已停止';
+    document.getElementById('p-slots').textContent = state.activeSlotDir || '(未安装)';
+    fillRegistry(state);
+    document.getElementById('p-count').textContent = state.slotCount + ' 个（上限 ' + state.maxSlots + '）';
+    document.getElementById('p-size').textContent = fmtMB(state.totalSizeMB) || '0 MB';
+
+    // 超限：只提示（非弹窗），带跳转按钮方便清理
+    var quota = document.getElementById('quota');
+    if (state.slotCount > state.maxSlots) {
+      document.getElementById('quota-text').textContent =
+        '已下载 ' + state.slotCount + ' 个版本（上限 ' + state.maxSlots + '），共占用 '
+        + fmtMB(state.totalSizeMB) + '，建议清理不再需要的版本 —— 每个版本约 220 MB。';
+      quota.classList.add('show');
+    } else {
+      quota.classList.remove('show');
+    }
+
+    var list = document.getElementById('list');
+    if (!state.versions || state.versions.length === 0) {
+      list.innerHTML = '<div class="empty">还没有可展示的版本。<br>'
+        + (state.checking ? '正在检查更新…' : '点右上角「刷新」拉取远端版本列表（含 alpha）。')
+        + '</div>';
+    } else {
+      list.innerHTML = state.versions.map(function (row) { return rowHtml(row, state); }).join('');
+      Array.prototype.forEach.call(list.querySelectorAll('button[data-act]'), function (btn) {
+        btn.addEventListener('click', function () {
+          onAction(btn.getAttribute('data-act'), btn.getAttribute('data-ver'));
+        });
+      });
+    }
+
+    var refreshBtn = document.getElementById('btn-refresh');
+    refreshBtn.disabled = !!state.checking;
+    refreshBtn.textContent = state.checking ? '检查中…' : '刷新';
+
+    var text = state.status || '';
+    var kind = state.error ? 'err' : (state.busy ? 'busy' : '');
+    if (!text) {
+      text = '下载会进独立文件夹，互不覆盖；切换前会先确认，确认后自动重启应用。';
+    } else if (state.busy) {
+      kind = 'busy';
+    } else if (!state.error) {
+      kind = 'ok';
+    }
+    if (state.remoteStale && (state.versions || []).length) {
+      text += '（离线缓存' + (state.remoteCheckedAt ? ' · ' + fmtDate(state.remoteCheckedAt * 1000) : '') + '）';
+    } else if (!state.remoteOk && state.remoteError) {
+      text += '（远端列表不可用：' + state.remoteError + '）';
+    }
+    setStatus(text, kind);
+  }
+
+  function onAction(act, ver) {
+    if (!api) return;
+    if (act === 'download') {
+      setStatus('开始下载 dsh ' + ver + '…', 'busy');
+      api.download(ver).then(function (res) {
+        if (!res.ok) setStatus(res.error || '下载失败', 'err');
+      }).catch(function (error) { setStatus('下载失败：' + error, 'err'); });
+    } else if (act === 'switch') {
+      openSwitchConfirm(ver);
+    } else if (act === 'remove') {
+      openRemoveConfirm(ver);
+    } else if (act === 'cancel') {
+      api.cancel();
+    } else if (act === 'dir') {
+      api.open_slot_dir(ver);
+    }
+  }
+
+  // ---- 窗口内确认框（所有切换都必须先确认） ----
+  function openSwitchConfirm(ver) {
+    pendingSwitch = ver;
+    document.getElementById('dlg-title').textContent = '确认切换版本';
+    document.getElementById('dlg-body').innerHTML =
+      '确定切换到 <b>' + esc(ver) + '</b> 吗？<br>'
+      + '切换将<b>自动重启应用</b>（本地服务会中断几秒）。<br>'
+      + '预发布（alpha/beta）版本可能与现有会话数据不兼容，如有顾虑请先备份 '
+      + '%USERPROFILE%\\.dsh。';
+    document.getElementById('dlg-ok').textContent = '切换并重启';
+    document.getElementById('mask').classList.add('show');
+  }
+
+  function openRemoveConfirm(ver) {
+    pendingRemove = ver;
+    document.getElementById('dlg-title').textContent = '确认删除';
+    document.getElementById('dlg-body').innerHTML =
+      '确定删除已下载的 <b>' + esc(ver) + '</b> 吗？<br>'
+      + '这会连同它的依赖一起删掉（释放约 220 MB），以后要用得重新下载。';
+    document.getElementById('dlg-ok').textContent = '删除';
+    document.getElementById('mask').classList.add('show');
+  }
+
+  function closeDialog() {
+    pendingSwitch = null;
+    pendingRemove = null;
+    document.getElementById('mask').classList.remove('show');
+  }
+
+  function confirmDialog() {
+    if (pendingSwitch) {
+      var ver = pendingSwitch;
+      closeDialog();
+      setStatus('正在切换到 dsh ' + ver + '…', 'busy');
+      api.switch(ver).then(function (res) {
+        if (!res.ok) { setStatus(res.error || '切换失败', 'err'); return; }
+        restarting = true;
+        document.getElementById('restarting').classList.add('show');
+      }).catch(function (error) { setStatus('切换失败：' + error, 'err'); });
+    } else if (pendingRemove) {
+      var target = pendingRemove;
+      closeDialog();
+      setStatus('正在删除 dsh ' + target + '…', 'busy');
+      api.remove(target).then(function (res) {
+        setStatus(res.ok ? ('已删除 dsh ' + target) : (res.error || '删除失败'), res.ok ? 'ok' : 'err');
+      }).catch(function (error) { setStatus('删除失败：' + error, 'err'); });
+    }
+  }
+
+  function refresh() {
+    if (!api || restarting) return;
+    return api.state().then(render).catch(function (error) {
+      setStatus('读取状态失败：' + error, 'err');
+    });
+  }
+
+  function bind() {
+    document.getElementById('btn-refresh').addEventListener('click', function () {
+      setStatus('正在检查更新…', 'busy');
+      api.refresh();
+    });
+    document.getElementById('btn-slots-dir').addEventListener('click', function () { api.open_slots_dir(); });
+    document.getElementById('p-registry').addEventListener('change', function (ev) {
+      var value = ev.target.value;
+      setStatus('正在切换 npm 源…', 'busy');
+      api.set_registry(value).then(function (res) {
+        if (!res.ok) { setStatus(res.error || '换源失败', 'err'); return; }
+        if (res.unchanged) { setStatus('npm 源没有变化：' + res.registry, ''); return; }
+        setStatus('npm 源已切换：' + res.registry + '，之后的下载/检查更新都走它', 'ok');
+      }).catch(function (error) { setStatus('换源失败：' + error, 'err'); });
+    });
+    document.getElementById('btn-clean').addEventListener('click', function () { api.open_slots_dir(); });
+    document.getElementById('dlg-cancel').addEventListener('click', closeDialog);
+    document.getElementById('dlg-ok').addEventListener('click', confirmDialog);
+  }
+
+  window.addEventListener('pywebviewready', function () {
+    api = window.pywebview.api;
+    bind();
+    refresh();
+    setInterval(refresh, 1500);
+  });
+</script>
+</body>
+</html>
+"""
+
+
 # --------------------------------------------------------------------------- #
 # 应用主体
 # --------------------------------------------------------------------------- #
@@ -2053,6 +2974,7 @@ class DshShellApp(object):
         self.service = DshService()
         self.window = None
         self.manager_window = None
+        self.version_window = None
         self.icon = None
         self.quitting = False
         self.busy = threading.Lock()
@@ -2061,6 +2983,11 @@ class DshShellApp(object):
         # 插件管理器窗口底部那行状态文字
         self.plugin_status = ""
         self.plugin_error = False
+        # 版本管理器：状态文字 + 当前下载任务（{version, phase, running, lines, ...}）
+        self.vm_status = ""
+        self.vm_error = False
+        self.vm_task = None
+        self.vm_checking = False          # 正在打 npm view 刷新远端列表
         # 主窗口几何记忆：_last_geometry 记录最近一次已知的 (x, y, w, h)，
         # 退出/重启时写回 config.json。None 表示还没拿到过。
         self._last_geometry = None
@@ -2068,6 +2995,10 @@ class DshShellApp(object):
     def set_plugin_status(self, text, error=False):
         self.plugin_status = str(text or "")
         self.plugin_error = bool(error)
+
+    def set_vm_status(self, text, error=False):
+        self.vm_status = str(text or "")
+        self.vm_error = bool(error)
 
     # ---------------- 启动状态（写在那层原生 loading 上） ---------------- #
 
@@ -2172,6 +3103,376 @@ class DshShellApp(object):
         self.hide_plugin_manager()
         return False     # pywebview: 返回 False 取消关闭事件
 
+    # ---------------- 版本管理器窗口 ---------------- #
+
+    def show_version_manager(self, *_args):
+        window = self.version_window
+        if window is None:
+            log("版本管理器窗口不存在（创建失败？）")
+            self.notify("版本管理器打不开，请看日志")
+            return
+        try:
+            window.show()
+            window.restore()
+            log("打开版本管理器")
+        except Exception as exc:  # noqa: BLE001
+            log("显示版本管理器失败: %s" % exc)
+
+    def hide_version_manager(self):
+        window = self.version_window
+        if window is None:
+            return
+        try:
+            window.hide()
+        except Exception as exc:  # noqa: BLE001
+            log("隐藏版本管理器失败: %s" % exc)
+
+    def on_version_closing(self):
+        """版本管理器的关闭按钮 = 收起窗口，不销毁（要能反复打开）。"""
+        if self.quitting:
+            return True
+        self.hide_version_manager()
+        return False     # pywebview: 返回 False 取消关闭事件
+
+    # ---------------- 版本管理器：状态 / 动作 ---------------- #
+
+    def _vm_task_state(self):
+        """当前下载任务的快照（没有任务返回 None）。"""
+        task = self.vm_task
+        if not task:
+            return None
+        return {
+            "version": task["version"],
+            "phase": task["phase"],
+            "running": task["running"],
+            "elapsed": int(time.time() - task["started"]),
+            "ok": task.get("ok"),
+            "error": task.get("error") or "",
+            "tail": list(task["lines"])[-12:],
+        }
+
+    def version_manager_state(self):
+        """版本管理器窗口的状态快照（纯 JSON，**不打 npm**，轮询安全）。
+
+        远端列表来自缓存（内存 / config.versionsCache），刷新走 vm_refresh()。
+        """
+        remote = cached_remote_versions()
+        active = active_slot_version()
+        slots = [s for s in list_local_slots() if not s["partial"]]
+        local_by_ver = {s["version"]: s for s in slots}
+
+        rows = []
+        seen = set()
+        for item in remote.get("rows") or []:
+            ver = item.get("version")
+            if not ver or ver in seen:
+                continue
+            seen.add(ver)
+            slot = local_by_ver.get(ver)
+            rows.append(
+                {
+                    "version": ver,
+                    "channel": item.get("channel") or _channel_of(ver, {}),
+                    "publishedAt": item.get("publishedAt") or "",
+                    "installed": slot is not None,
+                    "active": ver == active,
+                    "sizeMB": slot_size_mb(slot["dir"]) if slot else None,
+                    "source": "remote",
+                }
+            )
+        # 本机有、远端列表里没有的（老版本 / 远端下架），追加在后面，仍可切换/删除
+        for ver in sorted(
+            (v for v in local_by_ver if v not in seen),
+            key=_version_sort_key,
+            reverse=True,
+        ):
+            slot = local_by_ver[ver]
+            rows.append(
+                {
+                    "version": ver,
+                    "channel": _channel_of(ver, {}),
+                    "publishedAt": "",
+                    "installed": True,
+                    "active": ver == active,
+                    "sizeMB": slot_size_mb(slot["dir"]),
+                    "source": "local-only",
+                }
+            )
+
+        total = 0
+        for slot in slots:
+            total += slot_size_mb(slot["dir"])
+        return {
+            "versions": rows,
+            "activeSlot": active,
+            "activeSlotDir": active_slot_dir(),
+            "installedVersion": self.service.installed_version(),
+            "serviceRunning": self.service.managed_running(),
+            "busy": self.busy.locked(),
+            "checking": self.vm_checking,
+            "slotCount": len(slots),
+            "maxSlots": max_slots(),
+            "totalSizeMB": total,
+            "registry": registry_label(effective_registry()),
+            "registryUrl": effective_registry(),
+            # 下拉框的数据源（托盘已不提供换源入口，换源只在这里）
+            "registryChoices": [
+                {"label": label, "url": url} for label, url in REGISTRY_CHOICES
+            ],
+            "remoteOk": bool(remote.get("ok")),
+            "remoteStale": bool(remote.get("stale")),
+            "remoteCheckedAt": remote.get("checkedAt") or 0,
+            "remoteError": remote.get("error") or "",
+            "task": self._vm_task_state(),
+            "status": self.vm_status,
+            "error": self.vm_error,
+            "packageName": PACKAGE,
+        }
+
+    def vm_refresh(self):
+        """强制刷新远端版本列表：后台打一次 npm view，立即返回当前快照。"""
+        if self.vm_checking:
+            return self.version_manager_state()
+        self.vm_checking = True
+        self.set_vm_status("正在检查更新…")
+
+        def worker():
+            try:
+                result = fetch_remote_versions(force=True)
+                rows = result.get("rows") or []
+                if result.get("ok") and rows:
+                    self.set_vm_status(
+                        "已检查更新：最新 %s %s" % (PACKAGE, rows[0]["version"])
+                    )
+                elif result.get("ok"):
+                    self.set_vm_status("已检查更新：远端没有返回任何版本", True)
+                else:
+                    self.set_vm_status(
+                        "检查更新失败：%s%s"
+                        % (
+                            result.get("error") or "未知错误",
+                            "（已回退缓存列表）" if rows else "",
+                        ),
+                        True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log("检查更新异常: %s\n%s" % (exc, traceback.format_exc()))
+                self.set_vm_status("检查更新异常：%s" % exc, True)
+            finally:
+                self.vm_checking = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        return self.version_manager_state()
+
+    def vm_start_download(self, version):
+        """把某个版本下载进新槽位（后台跑，可与服务并行）。"""
+        ver = sanitize_version(version)
+        if not ver:
+            return {"ok": False, "error": "版本号不合法：%r" % (version,)}
+        if os.path.isdir(slot_dir(ver)):
+            return {"ok": False, "error": "该版本已下载"}
+        if self.vm_task and self.vm_task.get("running"):
+            return {"ok": False, "error": "已有下载在进行（%s）" % self.vm_task["version"]}
+        if not self.busy.acquire(blocking=False):
+            return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
+        task = {
+            "version": ver,
+            "phase": "下载中",
+            "started": time.time(),
+            "running": True,
+            "lines": deque(maxlen=200),
+            "ok": None,
+            "error": "",
+        }
+        self.vm_task = task
+        self.set_vm_status("正在下载 dsh %s…" % ver)
+        log("开始下载槽位: %s" % ver)
+        threading.Thread(target=self._do_download, args=(task,), daemon=True).start()
+        return {"ok": True}
+
+    def _do_download(self, task):
+        ver = task["version"]
+
+        def on_line(line):
+            if line:
+                task["lines"].append(str(line))     # 供窗口轮询 progress 尾部
+
+        try:
+            ok, actual, tail = self.service.install_to_slot(
+                "%s@%s" % (PACKAGE, ver), ver, on_line
+            )
+            task["ok"] = ok
+            if not ok:
+                task["error"] = (tail or "").strip()[-400:]
+                self.set_vm_status("下载 dsh %s 失败：%s" % (ver, task["error"]), True)
+                self.notify("下载 dsh %s 失败，详情见版本管理器" % ver)
+            else:
+                task["phase"] = "完成"
+                self.set_vm_status(
+                    "dsh %s 已下载，点「切换」即可使用（切换会自动重启应用）"
+                    % (actual or ver)
+                )
+                self.notify("dsh %s 下载完成" % (actual or ver))
+        except Exception as exc:  # noqa: BLE001
+            task["ok"] = False
+            task["error"] = str(exc)
+            log("下载 dsh %s 异常: %s\n%s" % (ver, exc, traceback.format_exc()))
+            self.set_vm_status("下载 dsh %s 异常：%s" % (ver, exc), True)
+        finally:
+            task["running"] = False
+            self.busy.release()
+
+    def vm_cancel(self):
+        """取消进行中的下载：杀 npm 进程树，install_to_slot 失败后会清掉 .dl。"""
+        task = self.vm_task
+        if not task or not task.get("running"):
+            return {"ok": False, "error": "当前没有进行中的下载"}
+        self.set_vm_status("正在取消下载 dsh %s…" % task["version"])
+        self.service.stop_npm_install()
+        return {"ok": True}
+
+    def vm_set_registry(self, value):
+        """切换 npm 源（版本管理器窗口专用；托盘不再提供这个入口）。
+
+        value = REGISTRY_CHOICES 里的 URL，或空串 = 跟随系统 npm 配置。
+        只影响**之后**的 npm 调用（下载 / 检查更新 / 服务子进程的
+        npm_config_registry），不影响正在进行中的任务。
+        """
+        value = str(value or "").strip()
+        if value not in [url for _label, url in REGISTRY_CHOICES] + [""]:
+            return {"ok": False, "error": "未知的 npm 源：%r" % (value,)}
+        cfg = load_config()
+        current = (cfg.get("registry") or "").strip()
+        if value == current:
+            return {"ok": True, "unchanged": True,
+                    "registry": registry_label(value), "registryUrl": value}
+        # 切源后各 registry 的版本内容理论上一致，但缓存旧源的结果没有意义：
+        # 下次点「刷新」应该按新源重拉一次。
+        _versions_cache["result"] = None
+        cfg["registry"] = value
+        save_config(cfg)
+        label = registry_label(value)
+        log("npm 源切换为：%s（版本管理器）" % (value or "(系统默认)"))
+        self.set_vm_status("npm 源已切换：%s，之后的下载/检查更新都走它" % label)
+        self.notify("npm 源已切换：%s" % label)
+        return {"ok": True, "registry": label, "registryUrl": value}
+
+    def vm_switch(self, version):
+        """切换活动版本。**调用方必须先在窗口里完成确认**（见 VERSION_MANAGER_HTML）。
+
+        确认后的动作 = 记 activeSlot + 自动重启应用（新实例按新槽位起服务）。
+        立即返回 {ok}；真正的切换在后台线程里跑（先等窗口收到响应再动进程）。
+        """
+        ver = sanitize_version(version)
+        if not ver:
+            return {"ok": False, "error": "版本号不合法：%r" % (version,)}
+        if not os.path.isdir(slot_dir(ver)):
+            return {"ok": False, "error": "该版本尚未下载，请先下载"}
+        if ver == active_slot_version():
+            return {"ok": False, "error": "当前已经是这个版本"}
+        if not self.busy.acquire(blocking=False):
+            return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
+        threading.Thread(target=self._do_switch, args=(ver,), daemon=True).start()
+        return {"ok": True, "restarting": True}
+
+    def _do_switch(self, ver):
+        old = active_slot_version()
+        try:
+            set_active_slot(ver)
+            self.set_vm_status("正在切换到 dsh %s，应用将自动重启…" % ver)
+            log("切换版本: %s -> %s" % (old or "?", ver))
+            self.notify("正在切换到 dsh %s，应用即将重启…" % ver)
+            # 等窗口先拿到 {ok: True} 的响应（js_api 调用是并行的，这里只是稳妥）
+            time.sleep(1.2)
+            self._spawn_new_instance()
+            self.quit()          # 退出旧实例；_shutdown 会停掉服务
+        except Exception as exc:  # noqa: BLE001
+            log("切换 dsh %s 失败: %s\n%s" % (ver, exc, traceback.format_exc()))
+            if old and old != ver:
+                set_active_slot(old)
+            self.set_vm_status(
+                "切换失败：%s（已回滚到 dsh %s）" % (exc, old or "?"), True
+            )
+            self.notify("切换失败，已回滚到原版本")
+            try:
+                self.service.start()
+                if self.service.wait_ready():
+                    self.load_url()
+            except Exception as start_exc:  # noqa: BLE001
+                log("回滚后恢复服务失败: %s" % start_exc)
+            self.busy.release()
+
+    @staticmethod
+    def _spawn_new_instance():
+        """拉起一个新实例（带 DSH_UI_RESTART=1，会在单实例锁上等本实例退出）。"""
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            cmd = [exe]
+        else:
+            exe = os.path.abspath(sys.argv[0])
+            cmd = [sys.executable, exe]
+        if not os.path.isfile(exe):
+            raise RuntimeError("找不到可执行文件：%s" % exe)
+        env = os.environ.copy()
+        env["DSH_UI_RESTART"] = "1"
+        log("拉起新实例 %s" % " ".join(cmd))
+        subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(exe) or None,
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return True
+
+    def vm_remove(self, version):
+        """删除一个**非活动、非下载中**的槽位。"""
+        ver = sanitize_version(version)
+        if not ver:
+            return {"ok": False, "error": "版本号不合法：%r" % (version,)}
+        path = slot_dir(ver)
+        root = os.path.normcase(os.path.abspath(SLOTS_DIR)) + os.sep
+        if not os.path.normcase(os.path.abspath(path)).startswith(root):
+            return {"ok": False, "error": "拒绝删除槽位之外的路径"}
+        if not os.path.isdir(path):
+            return {"ok": False, "error": "该版本没有下载过"}
+        if ver == active_slot_version():
+            return {"ok": False, "error": "当前使用中的版本不能删除（先切换到别的版本）"}
+        task = self.vm_task
+        if task and task.get("running") and task["version"] == ver:
+            return {"ok": False, "error": "该版本正在下载，请先取消"}
+        if not self.busy.acquire(blocking=False):
+            return {"ok": False, "error": "已有任务在执行，等它跑完再试"}
+        try:
+            size = slot_size_mb(path)          # 删除前取一次（缓存里有就直接用）
+            shutil.rmtree(path)
+            _slot_size_cache.pop(path, None)
+            self.set_vm_status("已删除 dsh %s（释放 %d MB）" % (ver, size))
+            log("已删除槽位: %s" % path)
+            self.notify("已删除 dsh %s" % ver)
+            return {"ok": True}
+        except OSError as exc:
+            log("删除槽位失败 %s: %s" % (path, exc))
+            return {"ok": False, "error": "删除失败（可能有文件被占用）：%s" % exc}
+        finally:
+            self.busy.release()
+
+    def vm_open_slots_dir(self):
+        try:
+            os.makedirs(SLOTS_DIR, exist_ok=True)
+        except OSError:
+            pass
+        self._open_path(SLOTS_DIR)
+
+    def vm_open_slot_dir(self, version):
+        ver = sanitize_version(version)
+        if not ver:
+            return
+        path = slot_dir(ver)
+        if not os.path.isdir(path):
+            self.notify("该版本没有下载过")
+            return
+        self._open_path(path)
+
     # ---------------- 插件状态 / 同步 / 生效 ---------------- #
 
     def plugin_manager_state(self):
@@ -2262,8 +3563,7 @@ class DshShellApp(object):
 
     def _ensure_service(self, reload_page=True):
         try:
-            self.service.ensure_runtime_manifest()
-            mark("_ensure_service: manifest 就绪")
+            mark("_ensure_service: 启动流程开始")
 
             # 启动前先按「已启用的插件」把 plugins/ 镜像进 dsh 并刷新补丁文件。
             # 失败不阻塞启动：dsh 照常按现有补丁跑。
@@ -2287,15 +3587,21 @@ class DshShellApp(object):
                     % (PACKAGE, registry_label(effective_registry())),
                 )
                 self.notify("首次运行，正在安装 DeepSeek Harness…")
-                ok, output = self.service.npm_install(PACKAGE, self._npm_progress)
+                # 首装也走槽位：先 <名字>.dl，装完按实际版本 rename + 记为活动版本
+                ok, installed_ver, output = self.service.install_to_slot(
+                    PACKAGE, None, self._npm_progress
+                )
                 if not ok:
                     log("安装失败:\n%s" % output)
                     self.set_status("安装失败", output, "err")
                     self.set_tail(output)
                     self.notify("安装失败，详情见界面或日志")
                     return
+                if installed_ver:
+                    set_active_slot(installed_ver)
                 version = self.service.installed_version()
-                log("安装完成，版本 %s" % version)
+                log("安装完成，版本 %s（槽位 %s）"
+                    % (version, active_slot_dir()))
 
             # dsh 的访问 token 每次启动都会变，必须由本程序自己拉起服务才能拿到地址，
             # 所以端口上如果有残留进程，先清掉再重新启动。
@@ -2393,79 +3699,18 @@ class DshShellApp(object):
         （见 acquire_single_instance），所以这里先 spawn 再 quit 的顺序是安全的：
         新实例不会因为锁被占而直接退出。旧实例退出时 _shutdown() 会停掉 dsh 服务，
         新实例随后按正常启动流程把服务拉起来。
+        版本切换（vm_switch -> _do_switch）复用同一条路径。
         """
         if not self.busy.acquire(blocking=False):
             self.notify("已有任务在执行，请稍候")
             return
         try:
-            if getattr(sys, "frozen", False):
-                exe = sys.executable
-                cmd = [exe]
-            else:
-                exe = os.path.abspath(sys.argv[0])
-                cmd = [sys.executable, exe]
-            if not os.path.isfile(exe):
-                raise RuntimeError("找不到可执行文件：%s" % exe)
-            env = os.environ.copy()
-            env["DSH_UI_RESTART"] = "1"
-            log("重启应用：拉起新实例 %s" % " ".join(cmd))
-            subprocess.Popen(
-                cmd,
-                cwd=os.path.dirname(exe) or None,
-                env=env,
-                creationflags=CREATE_NO_WINDOW,
-            )
+            self._spawn_new_instance()
             self.quit()
         except Exception as exc:  # noqa: BLE001
             log("重启应用异常: %s\n%s" % (exc, traceback.format_exc()))
             self.set_status("重启失败", str(exc), "err")
             self.notify("重启失败：%s" % exc)
-        finally:
-            self.busy.release()
-
-    def action_update(self, *_args):
-        if not self.busy.acquire(blocking=False):
-            self.notify("已有任务在执行，请稍候")
-            return
-        threading.Thread(target=self._do_update, daemon=True).start()
-
-    def _do_update(self):
-        try:
-            before = self.service.installed_version()
-            log("开始更新，当前版本 %s" % before)
-            self.notify("开始更新 DeepSeek Harness…")
-            self.set_status("正在停止服务…", "更新前先关闭本地服务", "")
-            self.set_tail("")
-            self.service.stop()
-
-            self.set_status(
-                "正在通过 npm 拉取最新版本…",
-                "npm install %s@latest" % PACKAGE,
-            )
-            ok, output = self.service.npm_install(PACKAGE + "@latest", self._npm_progress)
-            if not ok:
-                log("更新失败:\n%s" % output)
-                self.set_status("更新失败", "已保留原有版本，正在恢复服务", "err")
-                self.set_tail(output)
-                self.notify("更新失败，尝试恢复原有服务")
-                self.start_service_async(reload_page=False)
-                return
-
-            after = self.service.installed_version()
-            log("更新完成 %s -> %s" % (before, after))
-            self.set_status("更新完成，正在重启服务…", "dsh %s" % (after or "?"), "done")
-            self.service.start()
-            self.service.wait_ready(poll_log=self.set_tail)
-            self.set_status("已更新到 dsh %s" % (after or "?"), "服务已就绪", "done")
-            self.load_url()
-            if before and after and before == after:
-                self.notify("已是最新版本 dsh %s" % after)
-            else:
-                self.notify("已更新：%s -> %s" % (before or "未安装", after or "?"))
-        except Exception as exc:  # noqa: BLE001
-            log("更新异常: %s\n%s" % (exc, traceback.format_exc()))
-            self.set_status("更新异常", str(exc), "err")
-            self.notify("更新异常：%s" % exc)
         finally:
             self.busy.release()
 
@@ -2488,42 +3733,21 @@ class DshShellApp(object):
         self.quit()
 
     def _version_label(self, _item=None):
-        version = self.service.installed_version()
-        source = "running" if self.service.running() else "stopped"
-        return "dsh %s · %s" % (version or "未安装", source)
-
-    def _update_label(self, _item=None):
-        return "正在更新…" if self.busy.locked() else "检查更新（npm）"
-
-    @staticmethod
-    def _registry_label(_item=None):
-        return "npm 源：%s" % registry_label(effective_registry())
-
-    def action_toggle_registry(self, *_args):
-        """托盘菜单点一下就在 镜像1 → 镜像2 → 镜像3 → 跟随系统 → 镜像1 之间轮换。"""
-        cfg = load_config()
-        current = (cfg.get("registry") or "").strip()
-        order = [url for _label, url in REGISTRY_CHOICES] + [""]
-        if current in order:
-            nxt = order[(order.index(current) + 1) % len(order)]
-        else:
-            nxt = order[0]
-        cfg["registry"] = nxt
-        save_config(cfg)
-        log("npm 源切换为：%s" % (cfg["registry"] or "(系统默认)"))
-        self.notify("npm 源已切换：%s" % registry_label(nxt))
+        """版本行只报版本号，不再带 running/stopped 状态（服务状态在版本管理器里看）。"""
+        return "dsh %s" % (self.service.installed_version() or "未安装")
 
     def build_menu(self):
+        # 托盘**没有**「检查更新」和「npm 源」入口：
+        # 检查/下载/切换/删除全部收进版本管理器窗口（选源保留给首次安装对话框）。
         return pystray.Menu(
             pystray.MenuItem("打开主界面", self.show_window, default=True),
             pystray.MenuItem("插件管理器", self.show_plugin_manager),
+            pystray.MenuItem("版本管理器", self.show_version_manager),
             pystray.MenuItem("在浏览器中打开", self.open_in_browser),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._version_label, None, enabled=False),
             pystray.MenuItem("重启服务", self.action_restart),
             pystray.MenuItem("重启应用", self.action_restart_app),
-            pystray.MenuItem(self._update_label, self.action_update),
-            pystray.MenuItem(self._registry_label, self.action_toggle_registry),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("打开数据目录", self.action_open_data),
             pystray.MenuItem("查看运行日志", self.action_open_log),
@@ -2563,7 +3787,7 @@ class DshShellApp(object):
 
         # 第一步只做「让用户看到程序已经关了」：隐藏窗口 + 停托盘。
         # 这两步都是毫秒级，所以点完「退出」界面几乎立刻消失。
-        for name in ("window", "manager_window"):
+        for name in ("window", "manager_window", "version_window"):
             window = getattr(self, name)
             if window is None:
                 continue
@@ -2585,7 +3809,7 @@ class DshShellApp(object):
     def _shutdown(self):
         """退出收尾：停安装/服务 -> 释放防睡眠 -> 销毁窗口 -> 强杀进程。"""
         try:
-            # 首次安装还在跑的话，先把 npm 进程树杀掉，别留 node 在后台下载
+            # 首次安装/版本下载还在跑的话，先把 npm 进程树杀掉，别留 node 在后台下载
             self.service.stop_npm_install()
         except Exception as exc:  # noqa: BLE001
             log("退出时终止 npm 安装失败: %s" % exc)
@@ -2598,7 +3822,7 @@ class DshShellApp(object):
         # 但显式释放更干净，也覆盖重启/更新等复用流程）。
         release_system_awake()
         mark("防睡眠已释放")
-        for name in ("window", "manager_window"):
+        for name in ("window", "manager_window", "version_window"):
             window = getattr(self, name)
             if window is None:
                 continue
@@ -2649,6 +3873,53 @@ class PluginManagerApi(object):
 
     def open_dsh_dir(self):
         self._app._open_path(dsh_home())
+
+    def open_log(self):
+        self._app._open_path(SHELL_LOG)
+
+
+# --------------------------------------------------------------------------- #
+# 版本管理器窗口的桥（窗口里的 JS 通过 pywebview.api.* 调这些方法）
+# --------------------------------------------------------------------------- #
+
+
+class VersionManagerApi(object):
+    """全部动作都**先由前端弹窗口内确认框**，这里只执行。
+
+    state() 只读缓存、绝不打 npm，1.5s 轮询不会卡 UI；
+    列表真正刷新走 refresh()（后台 npm view）。
+    """
+
+    def __init__(self, app):
+        self._app = app
+
+    def state(self):
+        return self._app.version_manager_state()
+
+    def refresh(self):
+        return self._app.vm_refresh()
+
+    def download(self, version):
+        return self._app.vm_start_download(version)
+
+    def cancel(self):
+        return self._app.vm_cancel()
+
+    def set_registry(self, value):
+        """换 npm 源：版本管理器窗口里的下拉框调它（托盘没有这个入口了）。"""
+        return self._app.vm_set_registry(value)
+
+    def switch(self, version):
+        return self._app.vm_switch(version)
+
+    def remove(self, version):
+        return self._app.vm_remove(version)
+
+    def open_slots_dir(self):
+        self._app.vm_open_slots_dir()
+
+    def open_slot_dir(self, version):
+        self._app.vm_open_slot_dir(version)
 
     def open_log(self):
         self._app._open_path(SHELL_LOG)
@@ -2976,6 +4247,20 @@ def main():
         return
     mark("单实例锁就绪")
 
+    # 多槽位布局：先清掉上次异常退出留下的 *.dl 半成品，再把老单目录迁进
+    # slots/<版本>/（同卷 rename，瞬间完成）。都在服务启动之前做。
+    try:
+        cleanup_partial_slots()
+    except Exception as exc:  # noqa: BLE001
+        log("清理下载残留异常（继续启动）: %s" % exc)
+    try:
+        if migrate_legacy_runtime():
+            mark("旧布局已迁移到槽位")
+    except Exception as exc:  # noqa: BLE001
+        log("旧布局迁移异常（继续启动）: %s" % exc)
+    log("活动槽位: %s（活动版本 %s）"
+        % (active_slot_dir(), active_slot_version() or "未安装"))
+
     # 启动即阻止系统睡眠（不阻止息屏/锁屏），退出时在 _shutdown 里释放。
     keep_system_awake()
     mark("防睡眠已设置")
@@ -3046,6 +4331,25 @@ def main():
     except Exception as exc:  # noqa: BLE001
         log("创建插件管理器窗口失败: %s\n%s" % (exc, traceback.format_exc()))
     mark("插件管理器窗口对象已建")
+
+    # 版本管理器：同样先建好、隐藏着，托盘菜单点开再 show()。
+    try:
+        version_win = webview.create_window(
+            "版本管理器 · %s" % APP_NAME,
+            html=VERSION_MANAGER_HTML,
+            width=880,
+            height=660,
+            min_size=(720, 520),
+            hidden=True,
+            background_color=WINDOW_BG,
+            text_select=True,
+            js_api=VersionManagerApi(app),
+        )
+        app.version_window = version_win
+        version_win.events.closing += app.on_version_closing
+    except Exception as exc:  # noqa: BLE001
+        log("创建版本管理器窗口失败: %s\n%s" % (exc, traceback.format_exc()))
+    mark("版本管理器窗口对象已建")
 
     app.start_tray()
     mark("托盘已起")
