@@ -3219,6 +3219,12 @@ VERSION_MANAGER_HTML = """<!doctype html>
   #dialog h2 { margin: 0 0 10px; font-size: 15px; }
   #dialog .body { font-size: 12.5px; color: #47506a; line-height: 1.8; }
   #dialog .body b { font-family: Consolas, monospace; }
+  /* 恢复「非当前版本」备份时的红字提醒 */
+  #dialog .body .dlg-warn {
+    margin-top: 10px; padding: 9px 11px; border-radius: 8px;
+    background: rgba(214, 60, 76, .08); border: 1px solid rgba(214, 60, 76, .35);
+    color: var(--off); font-weight: 600; line-height: 1.7;
+  }
   #dialog .btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
   /* 重启遮罩 */
   #restarting {
@@ -3582,12 +3588,25 @@ VERSION_MANAGER_HTML = """<!doctype html>
 
   function openRestoreConfirm(name) {
     pendingRestore = name;
+    // 备份属于哪个版本：从备份清单里按名字找（backupRowHtml 渲染时带 version）
+    var bkVer = '';
+    (last && last.backups || []).forEach(function (bk) {
+      if (bk.name === name) bkVer = bk.version;
+    });
+    var curVer = last ? (last.installedVersion || '') : '';
+    var isCurrent = bkVer && curVer && bkVer === curVer;
     document.getElementById('dlg-title').textContent = '确认恢复配置';
     document.getElementById('dlg-body').innerHTML =
       '确定用备份 <b>' + esc(name) + '</b> 覆盖配置吗？<br>'
       + '恢复前会<b>先把当前配置自动备份一次</b>（不会丢现在的状态）。<br>'
-      + '恢复的是当前活动版本时，会<b>停服务 → 恢复 → 重启服务</b>；'
-      + '别的版本要等切过去才生效。';
+      + (isCurrent
+        ? '恢复的是当前活动版本，会<b>停服务 → 恢复 → 重启服务</b>。'
+        : '恢复的是<b>别的版本</b>（' + esc(bkVer || '?') + '），'
+          + '要等切到那个版本才生效；当前版本（' + esc(curVer || '?') + '）的配置不受影响。')
+      + (isCurrent ? '' : '<div class="dlg-warn">⚠ 注意：这份备份属于 '
+        + esc(bkVer || '?') + '，不是当前版本 ' + esc(curVer || '?')
+        + '。恢复后需切换到 ' + esc(bkVer || '?') + ' 才能看到效果，'
+        + '且不会改动当前版本的配置。</div>');
     document.getElementById('dlg-ok').textContent = '恢复';
     document.getElementById('mask').classList.add('show');
   }
