@@ -52,6 +52,7 @@ src/                         代码（含构建、打包、自测）
     ├── probe_update.py          多槽位版本链路：远端列表（含 alpha）/ 下载 / 占用
     ├── probe_version_manager.py 版本管理器窗口 + js_api 桥 + 每版本配置目录 + 备份/恢复
     ├── probe_plugins.py         插件同步：扫描 → 镜像进 dsh → 重写托管补丁块
+    ├── probe_dsh_compat.py      dsh 升级后的插件兼容体检（插件依赖的内部接口还在不在）
     └── probe_plugin_manager.py  插件管理器窗口 + js_api 桥 + 红绿灯渲染
 
 build/                       PyInstaller 工作目录 + Python 字节码缓存（build/pycache）
@@ -198,6 +199,46 @@ dist/
 
 插件目录里 `cordis.patch.yml` 的 `./plugins/<id>/<entry>` 是**相对 profile 目录**的
 路径，dsh 的 loader 会把它转成 `file://` —— 所以插件本身可以放在任何地方。
+
+### 浮层样式：`--dsw-specific-menu` 必须配 `backdrop-filter`
+
+插件的浮层（面板 / 弹窗 / toast）一律 `position:fixed` 挂在页面里，背景用 dsh 的
+菜单色变量。**这个变量在 dsh 0.1.7 变成了半透明色**：
+
+| | `--dsw-specific-menu` | 配套 |
+|---|---|---|
+| ≤ 0.1.5-rc.x | `var(--dsw-alias-bg-layer-3)`（不透明） | 无 |
+| ≥ 0.1.7-alpha | 浅色 `#f8f9fa94` / 深色 `#30313680`（**半透明**） | `--dsw-menu-backdrop-filter: blur(40px) saturate(150%)` |
+
+上游自己的面板都把那层模糊加在背景上（有的是 `::before` 层），只留 background 的话
+浮层就变成「透明白」—— 能看见底下滚动的对话内容（用户实测报过「dsh-cf 面板背景变
+透明白」）。所以规则是：**凡是 `background:var(--dsw-specific-menu,…)` 的规则，
+紧跟着写 `backdrop-filter:var(--dsw-menu-backdrop-filter,none)`**。
+
+老版本没有 `--dsw-menu-backdrop-filter`，回退 `none`，那时菜单色本来就不透明，
+画面与升级前完全一致 —— 一条声明同时满足两个版本。
+`probe_dsh_compat.py` 会逐个体检这条配对（与 dsh 版本无关的那组检查）。
+
+⚠️ 顺带一条容易踩的副作用：**`backdrop-filter` 会让该元素成为 `position:fixed`
+后代的包含块**（和 `transform`/`filter` 一样）。浮层里如果有 fixed 定位的东西
+（usage 柱状图的气泡就是），要把它 `createPortal` 到 `document.body` —— 否则坐标
+会按浮层的 padding 原点算、还会被 `overflow:auto` 裁掉。上游自己的浮层用
+`isolation:isolate` + `::before` 承载背景，也是同一个原因（`isolation` 只建层叠
+上下文，不建包含块）。
+
+### 浏览器半边取服务的规矩：可选服务只能 `ctx.get()`
+
+cordis 的 ctx 是 Proxy：**属性访问 `ctx.foo` 只对「写进 `inject` 且已就绪」的服务安全**，
+其它情况那个 getter 会直接**抛** `cannot get property "foo" without inject`
+（服务还没被 provide、或者活在别的 isolate 里，都算「没有」）。而 apply 抛异常 =
+这个插件条目整个变 failed，界面上就报 `dsh-loop-guard: failed`（`web boot: 1 entry
+did not activate` 那行下面）。实测踩过：换会话入口搬到 `uiWorkspace` 之后，
+插件在它还没挂上时用属性访问读了一次。
+
+所以：**必需的服务写进 `inject`**（拿属性访问没事），**可选/可能晚到的服务一律
+`ctx.get(id)`**（拿不到给 undefined，不抛）。`probe_dsh_compat.py` 里有一组
+与版本无关的检查专门管这条：静态扫 `ctx.X` 有没有越出 inject 名单，再用**严格 ctx**
+（访问未知服务就抛，模拟 cordis 真实行为）真跑一遍每个插件半边的 `apply`。
 
 ### 内置：`gitbash`
 
@@ -398,6 +439,9 @@ dsh 那 3.0 秒里：
 
 <venv>/Scripts/python.exe src/tools/probe_lan_access.py          # 局域网访问插件
 <venv>/Scripts/python.exe src/tools/probe_retry.py               # 消息编辑 / 重试插件
+
+<venv>/Scripts/python.exe src/tools/probe_dsh_compat.py          # 升级 dsh 后跑这个
+<venv>/Scripts/python.exe src/tools/probe_dsh_compat.py --slot 0.1.7-alpha.2
 ```
 
 `probe_gui.py` 可以带一个参数：不传跑源码，传 exe 路径就测打包产物。
@@ -414,6 +458,15 @@ dsh 那 3.0 秒里：
 上下文 / 只有附件 / 轮次不存在）、宿主接口的参数与错误分支（含观测租约释放、退回活动会话），
 以及浏览器半边的按钮注入幂等、行重建后自己长回来、重试 / 编辑 / 第一轮走新建 / 正在跑先
 cancel / 四类失败路径。
+
+`probe_dsh_compat.py` 是**升级 dsh 之后**的体检：dsh 改内部接口时插件往往不报错，
+只是静默降级（执行器退回上游默认 argv、某个改写装不上、前端锚点找不到），界面还能开。
+所以按「插件 → 它依赖的 dsh 接口」列成一张表（`probe_dsh_compat_checks.mjs`），
+逐个已下载槽位核对：类原型上的方法（含「老版叫 run/start、新版叫 execute」这种改名，
+只要有一组齐全就算过）、`ctx` 服务名、以及那些**字面契约**（事件名、DOM 属性、
+插槽名、工具名）。最后 gitbash 那条会真跑一条 `bash -c`，检查 spawn 的 argv[0]
+还是不是 Git Bash 绝对路径 —— 接口改名导致的「改了但没生效」只有真跑才看得出来。
+它**只读**：不启动服务、不写 `%LOCALAPPDATA%`，只读槽位里的包文件 + 跑一条本地 bash。
 
 #### 耗时诊断
 

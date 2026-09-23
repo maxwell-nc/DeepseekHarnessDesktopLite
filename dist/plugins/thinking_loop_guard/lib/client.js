@@ -30,7 +30,7 @@ window.__ModuleLoader__.load({
 			".tlg-badge.tlg-live{background:var(--dsw-alias-state-business-primary,#4d6bfe)}" +
 			".tlg-fallback{position:fixed;right:14px;bottom:14px;z-index:9000}" +
 			".tlg-fallback .tlg-btn{box-shadow:0 4px 14px rgba(16,24,40,.22)}" +
-			".tlg-panel{position:fixed;right:24px;bottom:96px;z-index:9000;box-sizing:border-box;width:min(430px,calc(100vw - 48px));max-height:min(56vh,540px);overflow-y:auto;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.14));border-radius:12px;background:var(--dsw-specific-menu,#fff);color:var(--dsw-alias-label-secondary,#5b6478);box-shadow:0 12px 30px rgba(16,24,40,.18);font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:12px;line-height:1.65}" +
+			".tlg-panel{position:fixed;right:24px;bottom:96px;z-index:9000;box-sizing:border-box;width:min(430px,calc(100vw - 48px));max-height:min(56vh,540px);overflow-y:auto;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.14));border-radius:12px;background:var(--dsw-specific-menu,#fff);backdrop-filter:var(--dsw-menu-backdrop-filter,none);color:var(--dsw-alias-label-secondary,#5b6478);box-shadow:0 12px 30px rgba(16,24,40,.18);font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:12px;line-height:1.65}" +
 			".tlg-head{display:flex;align-items:center;gap:8px}" +
 			".tlg-title{flex:1;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#1b2130)}" +
 			".tlg-toggle{border:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.14));background:transparent;color:var(--dsw-alias-label-secondary,#5b6478);font:inherit;font-size:12px;line-height:1;border-radius:999px;padding:5px 10px;cursor:pointer}" +
@@ -86,7 +86,7 @@ window.__ModuleLoader__.load({
 			panel: null, btn: null, badge: null, fallbackRoot: null,
 			open: false, timer: null, pulseTimer: null, fallbackTimer: null,
 			observer: null, sweepTimer: null, data: null, busy: false, anchored: false,
-			ackHits: 0, sessions: null, pendingOpen: null, ackedChild: null, openBusy: false
+			ackHits: 0, sessions: null, uiWorkspace: null, pendingOpen: null, ackedChild: null, openBusy: false
 		};
 
 		/** 建一个元素（textContent 赋值，模型内容永不走 innerHTML）。 */
@@ -271,16 +271,37 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 宿主刚分支重跑出一个新会话：refresh + open 把用户带过去（retry 的同款
-		 * 流程）。列表还没落进 store 时 open 会失败 —— 跨轮询最多试 3 次，成功后
+		 * 把界面切到某个会话 —— 换会话的入口随 dsh 版本搬过家（同 retry 的 openSession）：
+		 *   dsh ≥ 0.1.7-alpha  `sessions.open(id)` 被删，改用 `uiWorkspace.openSession(id)`；
+		 *   dsh ≤ 0.1.5-rc.x   两个都在，优先 `uiWorkspace.openSession`（内部就是
+		 *                      sessions.open + 关侧栏面板），`sessions.open` 兜底。
+		 *
+		 * @returns 是否真的切过去了。
+		 */
+		function openSession(childId) {
+			const uiWorkspace = state.uiWorkspace;
+			if (uiWorkspace !== null && uiWorkspace !== undefined && typeof uiWorkspace.openSession === "function") {
+				uiWorkspace.openSession(childId);
+				return true;
+			}
+			const sessions = state.sessions;
+			if (sessions !== null && sessions !== undefined && typeof sessions.open === "function") {
+				sessions.open(childId);
+				return true;
+			}
+			return false;
+		}
+
+		/**
+		 * 宿主刚分支重跑出一个新会话：refresh + 切过去把用户带过去（retry 的同款
+		 * 流程）。列表还没落进 store 时切换会失败 —— 跨轮询最多试 3 次，成功后
 		 * POST /opened 让宿主清掉待跳转标记。
 		 */
 		async function handlePendingChild() {
 			const data = state.data;
 			const child = data !== null && data !== undefined && typeof data.pendingChild === "string" ? data.pendingChild : "";
 			if (child.length === 0 || child === state.ackedChild) return;
-			const sessions = state.sessions;
-			if (sessions === null || sessions === undefined || typeof sessions.open !== "function") return;
+			if (state.sessions === null || state.sessions === undefined) return;
 			if (state.pendingOpen === null || state.pendingOpen.childId !== child) {
 				state.pendingOpen = { childId: child, tries: 0 };
 			}
@@ -290,11 +311,11 @@ window.__ModuleLoader__.load({
 			pending.busy = true;
 			try {
 				try {
-					await sessions.refresh();
+					await state.sessions.refresh();
 				} catch {
-					// 刷新失败也接着试 open（可能列表本来就更新过了）
+					// 刷新失败也接着试切换（可能列表本来就更新过了）
 				}
-				sessions.open(child);
+				if (!openSession(child)) throw new Error("no session opener");
 				state.ackedChild = child;
 				try {
 					await fetch(OPENED_API, {
@@ -420,16 +441,46 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 取一个**可选**服务：能拿到就返回，没有（或还没挂上）返回 null。
+		 *
+		 * 为什么不能直接 `ctx.uiWorkspace`：cordis 里属性访问只对**写进 `inject` 且已就绪**
+		 * 的服务安全 —— 其它情况下那个 getter 会**抛**
+		 * `cannot get property "uiWorkspace" without inject`（服务还没被 provide、
+		 * 或在别的 isolate 里都算「没有」）。而 apply 里抛异常 = 整个插件条目变 failed，
+		 * 界面上直接报 `dsh-loop-guard: failed`（实测踩过）。
+		 * `ctx.get(id)` 是按名字取、拿不到给 undefined，才是可选服务的正规入口。
+		 */
+		function optionalService(ctx, id) {
+			try {
+				if (typeof ctx.get === "function") {
+					const found = ctx.get(id);
+					if (found !== undefined && found !== null) return found;
+				}
+			} catch {
+				// 落到属性访问再试一次
+			}
+			try {
+				return ctx[id] !== undefined ? ctx[id] : null;
+			} catch {
+				return null;
+			}
+		}
+
+		/**
 		 * 客户端半边入口。
 		 *
-		 * 需要 sessions：宿主分支重跑出新会话后，由这里 refresh + open 把用户带
+		 * 需要 sessions：宿主分支重跑出新会话后，由这里 refresh + 切过去把用户带
 		 * 过去（retry 的同款依赖）。界面本身仍是纯 DOM。
+		 * uiWorkspace 只是**可选**软取 —— 换会话的入口在 0.1.7 搬到了它上面
+		 * （见 openSession），但它可能比本插件晚挂上，所以不能写进 inject、也不能
+		 * 用会抛的属性访问。
 		 *
 		 * @param ctx - 客户端 root context。
 		 */
 		function apply(ctx) {
 			if (typeof document === "undefined") return;
-			state.sessions = ctx.sessions !== undefined ? ctx.sessions : null;
+			state.sessions = optionalService(ctx, "sessions");
+			state.uiWorkspace = optionalService(ctx, "uiWorkspace");
 			const boot = () => {
 				try {
 					install();

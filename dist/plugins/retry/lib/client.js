@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
 			".dshr-action[data-busy=\"1\"]{cursor:default;opacity:.4}" +
 			".dshr-action[data-busy=\"1\"]:hover{background:transparent;color:var(--dsw-alias-label-tertiary,#8a93a8)}" +
 			".dshr-backdrop{position:fixed;inset:0;z-index:9400;background:rgba(16,24,40,.28)}" +
-			".dshr-panel{position:fixed;z-index:9401;left:50%;top:18vh;transform:translateX(-50%);box-sizing:border-box;width:min(640px,calc(100vw - 32px));max-height:min(76vh,720px);display:flex;flex-direction:column;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.24));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6}" +
+			".dshr-panel{position:fixed;z-index:9401;left:50%;top:18vh;transform:translateX(-50%);box-sizing:border-box;width:min(640px,calc(100vw - 32px));max-height:min(76vh,720px);display:flex;flex-direction:column;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);backdrop-filter:var(--dsw-menu-backdrop-filter,none);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.24));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6}" +
 			".dshr-head{display:flex;align-items:center;gap:10px}" +
 			".dshr-title{flex:1;font-size:14px;font-weight:600}" +
 			".dshr-hint{margin-top:6px;font-size:12px;color:var(--dsw-alias-label-tertiary,#8a93a8);line-height:1.7}" +
@@ -71,7 +71,7 @@ window.__ModuleLoader__.load({
 		const ACTIONS_CLASS = /(?:^|\s)[A-Za-z0-9_-]+_actions(?:\s|$)/;
 
 		/** 插件运行态（apply 时填）。单页单实例。 */
-		const state = { sessions: null };
+		const state = { sessions: null, uiWorkspace: null };
 
 		/* --------------------------------------------------------------------- */
 		/* 极简 DOM 工具                                                          */
@@ -524,11 +524,37 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 把界面切到某个会话 —— 换会话的入口随 dsh 版本搬过家：
+		 *
+		 *   dsh ≥ 0.1.7-alpha   `sessions.open(id)` 被删掉了，界面本身改用
+		 *                       `uiWorkspace.openSession(id)`（切主视图 + 关侧栏面板）。
+		 *   dsh ≤ 0.1.5-rc.x    `uiWorkspace.openSession(id)` 也在（它内部就是
+		 *                       `sessions.open(id)` + `layout.selectPanel(null)`），
+		 *                       所以优先走它，两个版本都是同一条路。
+		 *   兜底：`sessions.open(id)`（更老的部署，或者 uiWorkspace 没挂上时）。
+		 *
+		 * @returns 是否真的切过去了（两条路都不通就是 false）。
+		 */
+		function openSession(childId) {
+			const uiWorkspace = state.uiWorkspace;
+			if (uiWorkspace !== null && uiWorkspace !== undefined && typeof uiWorkspace.openSession === "function") {
+				uiWorkspace.openSession(childId);
+				return true;
+			}
+			const sessions = state.sessions;
+			if (sessions !== null && sessions !== undefined && typeof sessions.open === "function") {
+				sessions.open(childId);
+				return true;
+			}
+			return false;
+		}
+
+		/**
 		 * 把界面切到新分支。
 		 *
 		 * 子会话是宿主建的，浏览器这边的会话列表还不知道它 —— 先 `refresh()` 拉一次权威
-		 * 列表，再 `open()`。第一次 open 失败（列表还没落进 store）就再刷一次；
-		 * 还是不行就不 open 了（分支已经建好、消息也发出去了，用户去侧边栏点开一样）。
+		 * 列表，再 `openSession()`。第一次没切开（列表还没落进 store）就再刷一次；
+		 * 还是不行就不切了（分支已经建好、消息也发出去了，用户去侧边栏点开一样）。
 		 *
 		 * @returns 是否真的切过去了。
 		 */
@@ -539,11 +565,10 @@ window.__ModuleLoader__.load({
 				try {
 					await sessions.refresh();
 				} catch {
-					// 刷新失败也接着试 open（可能列表本来就更新过了）
+					// 刷新失败也接着试切换（可能列表本来就更新过了）
 				}
 				try {
-					sessions.open(childId);
-					return true;
+					if (openSession(childId)) return true;
 				} catch {
 					// 多半是列表里还没有这个 id，再刷一次
 				}
@@ -664,7 +689,7 @@ window.__ModuleLoader__.load({
 		 * 只留 `sessions`（定位当前会话、刷列表、切过去都要它）：建分支和发消息都在
 		 * 宿主那边，浏览器不用再看工作区/模型选择那套。
 		 */
-		function install(sessions) {
+		function install(sessions, uiWorkspace) {
 			// 上一份（热重载前）先撤干净：两套观察器和两套按钮叠在一起会互相打架。
 			// 注意必须在首扫**之前**撤 —— `dispose()` 会把带标记的节点全摘掉。
 			const previous = window.__DSH_UI_RETRY__;
@@ -677,6 +702,7 @@ window.__ModuleLoader__.load({
 			}
 
 			state.sessions = sessions;
+			state.uiWorkspace = uiWorkspace;
 			const queue = [];
 			let timer = null;
 
@@ -723,6 +749,30 @@ window.__ModuleLoader__.load({
 		const inject = ["sessions"];
 
 		/**
+		 * 取一个**可选**服务：能拿到就返回，没有（或还没挂上）返回 null。
+		 *
+		 * 为什么不能直接 `ctx.uiWorkspace`：cordis 里属性访问只对**写进 `inject`
+		 * 且已就绪**的服务安全 —— 其它情况那个 getter 会**抛**
+		 * `cannot get property "uiWorkspace" without inject`（服务还没被 provide、
+		 * 或在别的 isolate 里都算「没有」）。`ctx.get(id)` 才是可选服务的正规入口。
+		 */
+		function optionalService(ctx, id) {
+			try {
+				if (typeof ctx.get === "function") {
+					const found = ctx.get(id);
+					if (found !== undefined && found !== null) return found;
+				}
+			} catch {
+				// 落到属性访问再试一次
+			}
+			try {
+				return ctx[id] !== undefined ? ctx[id] : null;
+			} catch {
+				return null;
+			}
+		}
+
+		/**
 		 * 客户端半边入口。
 		 *
 		 * @param ctx - 客户端 root context。
@@ -730,7 +780,7 @@ window.__ModuleLoader__.load({
 		function apply(ctx) {
 			const start = () => {
 				try {
-					install(ctx.sessions);
+					install(optionalService(ctx, "sessions"), optionalService(ctx, "uiWorkspace"));
 				} catch (error) {
 					console.error("[dsh-ui-retry] 挂界面失败：" + message(error));
 				}

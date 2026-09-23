@@ -116,7 +116,12 @@ headless / tui profile 里会**永远停在 pending**，连采集都不跑；而
 **入口挂在 `sidebar.footer.action`。** 这个 slot 在 DOM 里排在 `sidebar.settings`
 **之前**，而侧边栏底栏是 flex-column，所以天然就在设置按钮上方；展开时是整行，
 收起成轨道时只剩图标（`wide` 由 shell 传进来）。面板用 `createPortal` + `position: fixed`
-挂到 body，因为侧边栏有 overflow 和 transform 动画，留在原位会被裁掉。
+挂到 body，因为侧边栏有 overflow 和 transform 动画，留在原位会被裁掉。**面板背景必须配 `backdrop-filter`（dsh 0.1.7 起）。** `--dsw-specific-menu` 从
+不透明色变成了半透明色，只留 background 会变成「透明白」（看见底下的对话）。
+见根 README「浮层样式」一节。**柱状图的气泡（`.dshu-tip`）也挂在 body**：它是
+`position: fixed` 且坐标来自 `getBoundingClientRect()`（视口系），而带
+`backdrop-filter` 的面板会成为 fixed 后代的**包含块** —— 留在面板里会被面板的
+padding 原点偏移、还会被 `overflow:auto` 裁掉。
 
 **读取接口不需要注入 webServer。** `ctx.connection.fetch.register` 会把路由登记到
 connection 自己挂在 `/api` 前缀上的共享 Fetch 处理器里，Host/Origin 围栏和浏览器

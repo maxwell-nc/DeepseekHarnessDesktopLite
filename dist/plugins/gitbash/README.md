@@ -146,6 +146,29 @@ realm 的可见性过滤 —— api-proxy 的每个浏览器 RPC（session contr
 `serviceForAgent(registrationCtx, owner, 'terminals')`，拿不到再退回注册时捕获的
 ctx 与 `exec.agent.ctx`（标准模式等非隔离场景仍直接可见）。
 
+v2.3.0 跟上 dsh 0.1.7 的接口改名（**同时保留旧版本兼容** —— 两套接口都实现，
+各自版本只走自己那套）：
+
+| | dsh ≤ 0.1.5-rc.x | dsh ≥ 0.1.7-alpha |
+|---|---|---|
+| 执行器入口 | `run(spec)` / `start(spec)` → `runArgv` / `startArgv` | `execute(spec)` → `executeArgv`（前台/后台只是「谁 await 句柄的 `result()`」） |
+| 沙箱 `confine` | `confine(command, policy)`（同步返回 ConfinedArgv） | `confine(command, policy, signal)`（多一个取消信号，返回 Promise） |
+| `serviceForAgent` 所在包 | `@deepseek-ai/dsh-agent-presets` | `@deepseek-ai/dsh-agent-preset-registry` |
+| 极简模式持久工具 | 名字与 schema 形状没变（仍叫 `pwsh`、仍只有 `command`） | 同左 |
+| 补丁关掉的上游条目 | `bash-sandbox` / `pwsh-sandbox` | 同左（id 没变） |
+
+`LocalBashExecutor` 的入口方法在 0.1.7 从 `run`/`start` 合并成了 `execute`。**只改
+这个名字就会静默降级**：插件覆写的 `run` 不再被调用，上游基类的 `execute` 直接拿
+硬编码的 `["bash", "-c", …]` 去 spawn —— 也就是回到「裸 bash」那条路。本机因为
+PATH 里有别的 bash（TortoiseGit）还能跑起来，换台机器就是 ENOENT，所以这层兼容
+必须补上。`serviceForAgent` 是极简模式取 agent 隔离 `terminals` 的唯一可靠路径
+（v2.2.2 的结论），包名换了之后 `loadHost` 会解析失败、持久工具又拿不到 terminals，
+同样是静默降级。
+
+自测：`src/tools/probe_dsh_compat.py`（跨版本统一查，见根 README「自测」一节），
+其中 gitbash 那条会**真跑一条 `bash -c` 并检查 spawn 的 argv[0]** —— 接口改名
+这种「改了但没生效」的退化只有真跑才看得出来。
+
 ## 跨机器 / 跨项目的细节
 
 - **插件里没有绝对路径。** 插件需要 `@deepseek-ai/dsh-bash-local` 这类包才能

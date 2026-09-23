@@ -113,6 +113,18 @@ seed     = events.slice(0, cut)
 且带序号的都算占过，取 `max+1`；源标题自己带的序号也参与（源是 `base (1)` 时从 2 开始）。
 规则在 `branchTitle()`（纯函数，自测直接对答案），`titles` 为空时退化成 `(1)`。
 标题从日志里最后一条 `session/title` 事件取，改名走 `sessionController.rename()`。
+- **切到新分支的入口随 dsh 版本搬过家**（v1.1.2）：`sessions.open(id)` 在 0.1.7
+  被删掉了，界面改用 `uiWorkspace.openSession(id)`（内部就是切主视图 + 关侧栏面板）。
+  浏览器半边现在优先 `uiWorkspace.openSession`、退回 `sessions.open` —— 两个版本
+  都走得通（`uiWorkspace` 从 0.1.5 起就在，只是老版本里它内部转调 `sessions.open`）。
+  用老写法在 0.1.7 上**不报错、只是没反应**：分支建好了、消息也发出去了，就是
+  不会切过去（`sessions.open` 是 undefined，调用被 try/catch 吞掉）。
+- **可选服务不能走属性访问**（v1.1.4）：`uiWorkspace` 不在 `inject` 里（写进去会
+  让插件等它，晚挂上就一直 pending），而 cordis 的 `ctx.uiWorkspace` 在服务还没就绪
+  时会**抛** `cannot get property "uiWorkspace" without inject` —— 浏览器半边这里
+  原本靠外层 try/catch 兜着（表现为「不跳分支」），thinking_loop_guard 同款写法
+  直接把条目搞成 failed。现在两处都改走 `optionalService()`（`ctx.get`）。
+  规则见根 README「浏览器半边取服务的规矩」。
 
 ## 按钮是怎么插进去的
 

@@ -10,6 +10,13 @@ window.__ModuleLoader__.load({
 		/**
 		 * 样式全部走一套自己的 class 前缀（dshu-），但颜色一律引用 dsh 主题的
 		 * `--dsw-*` 变量并带浅色兜底值 —— 这样跟着主题走，也不会因为变量缺失变透明。
+		 *
+		 * 浮层背景必须配 `backdrop-filter`：dsh 0.1.7 起 `--dsw-specific-menu` 从
+		 * 不透明色（`var(--dsw-alias-bg-layer-3)`）变成了**半透明**色（浅色
+		 * `#f8f9fa94` / 深色 `#30313680`），上游自己的浮层都靠
+		 * `--dsw-menu-backdrop-filter`（`blur(40px) saturate(150%)`）把它糊实。
+		 * 只留 background 的话，浮层会变成「透明白」——能看到底下的对话内容。
+		 * 老版本没有这个变量，回退 `none`，那时菜单色本来就不透明，画面不变。
 		 */
 		const css =
 			".dshu-root{display:flex;width:100%;min-width:0}" +
@@ -22,7 +29,7 @@ window.__ModuleLoader__.load({
 			".dshu-label{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}" +
 			".dshu-badge{flex:none;font-size:11px;color:var(--dsw-alias-label-tertiary,#8a93a8);font-variant-numeric:tabular-nums}" +
 			".dshu-backdrop{position:fixed;inset:0;z-index:9000;background:transparent}" +
-			".dshu-panel{position:fixed;z-index:9001;box-sizing:border-box;width:min(460px,calc(100vw - 28px));max-height:min(80vh,660px);overflow:auto;overscroll-behavior:contain;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.20));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6;-webkit-user-select:none;user-select:none}" +
+			".dshu-panel{position:fixed;z-index:9001;box-sizing:border-box;width:min(460px,calc(100vw - 28px));max-height:min(80vh,660px);overflow:auto;overscroll-behavior:contain;padding:16px 18px 14px;border-radius:16px;background:var(--dsw-specific-menu,#fff);backdrop-filter:var(--dsw-menu-backdrop-filter,none);color:var(--dsw-alias-label-primary,#1b2130);box-shadow:var(--dsw-elevation-prominent,0 18px 48px rgba(16,24,40,.20));font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;font-size:13px;line-height:1.6;-webkit-user-select:none;user-select:none}" +
 			".dshu-head{display:flex;align-items:center;gap:10px}" +
 			".dshu-title{flex:1;font-size:14px;font-weight:600}" +
 			".dshu-btn{height:26px;padding:0 10px;border:1px solid var(--dsw-alias-border-l1,rgba(22,32,58,.14));border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6478);font:inherit;font-size:12px;line-height:1;cursor:pointer}" +
@@ -280,33 +287,40 @@ window.__ModuleLoader__.load({
 				),
 				tip === null
 					? null
-					: h(
-							"div",
-							{ className: "dshu-tip", style: { left: tip.x, top: tip.y } },
+					: react_dom.createPortal(
 							h(
 								"div",
-								{ className: "dshu-tipHead" },
-								tip.date,
-								tip.total > 0
-									? h("span", { className: "dshu-tipHeadTotal" }, "合计 " + formatAmount(tip.total))
-									: null
-							),
-							tip.rows.length > 0
-								? h(
-										"div",
-										{ className: "dshu-tipList" },
-										tip.rows.map((row) =>
-											h(
-												react.Fragment,
-												{ key: row.id },
-												h("span", { className: "dshu-tipSwatch", style: { background: row.color } }),
-												h("span", { className: "dshu-tipName", title: row.id }, row.id),
-												h("span", { className: "dshu-tipNum" }, formatAmount(row.tokens)),
-												h("span", { className: "dshu-tipPct" }, formatShare(row.tokens, tip.total))
+								{ className: "dshu-tip", style: { left: tip.x, top: tip.y } },
+								h(
+									"div",
+									{ className: "dshu-tipHead" },
+									tip.date,
+									tip.total > 0
+										? h("span", { className: "dshu-tipHeadTotal" }, "合计 " + formatAmount(tip.total))
+										: null
+								),
+								tip.rows.length > 0
+									? h(
+											"div",
+											{ className: "dshu-tipList" },
+											tip.rows.map((row) =>
+												h(
+													react.Fragment,
+													{ key: row.id },
+													h("span", { className: "dshu-tipSwatch", style: { background: row.color } }),
+													h("span", { className: "dshu-tipName", title: row.id }, row.id),
+													h("span", { className: "dshu-tipNum" }, formatAmount(row.tokens)),
+													h("span", { className: "dshu-tipPct" }, formatShare(row.tokens, tip.total))
+												)
 											)
 										)
-									)
-								: h("div", { className: "dshu-tipDim" }, "没有用量")
+									: h("div", { className: "dshu-tipDim" }, "没有用量")
+							),
+							// 气泡挂到 body：坐标来自 getBoundingClientRect（视口系），
+							// 而面板现在带 backdrop-filter —— 那会让面板成为 fixed 后代的
+							// **包含块**，气泡留在面板里就会被面板的 padding 原点偏移、还被
+							// overflow:auto 裁掉。挂到 body 才是原来的视口语义。
+							document.body
 						)
 			);
 		}

@@ -65,7 +65,19 @@
  *        danger-full-access，于是连文件围栏一起被解掉。
  *    剩下唯一的偏差：shell 命令这一步不真正执行该模式，见第 4 条。
  *
- * 6) 改工具名的机制：`ctx.tools` 是 host 平面唯一的工具注册表（dsh-base 的 `tools` 行），
+ * 6) 【dsh 0.1.7 起的接口改名，两条都要接住】执行器与 agent 预设：
+ *      dsh ≤ 0.1.5-rc.x        dsh ≥ 0.1.7-alpha
+ *      LocalBashExecutor.run    LocalBashExecutor.execute（统一入口，调用方 await 句柄的
+ *      /runArgv/start/startArgv  /executeArgv；`result()` 才拿结算结果，超时/打断都靠
+ *                               spec.onExpiry + deadline 分类，不再有 run/start 之分）
+ *      SandboxBashExecutor.     SandboxBashExecutor.execute；confine(command, policy)
+ *        run/start               多了第三个参数 signal（沙箱准备阶段的取消）
+ *      @deepseek-ai/            @deepseek-ai/dsh-agent-preset-registry
+ *        dsh-agent-presets      （serviceForAgent 所在包改名，函数本身一字未改）
+ *    所以本插件两类方法都实现（老版本只调 run/start，新版本只调 execute，互不干扰），
+ *    并用 `loadHostFirst()` 按「新名在前」逐个试包名。详见下面的 dual-version 注释。
+ *
+ * 7) 改工具名的机制：`ctx.tools` 是 host 平面唯一的工具注册表（dsh-base 的 `tools` 行），
  *    agent 预设里的工具行都是往**同一个实例**注册（跨 scope 共享，this.ctx 由 cordis
  *    的 tracker 按调用方作用域重绑）。所以在本插件里给 `ToolRuntime.prototype.register`
  *    套一层，就能覆盖到所有作用域——包括 per-preset 的注册。上游 `register` 本身
@@ -75,7 +87,7 @@
  *    一次性工具和持久工具都叫 `pwsh`，按参数形状区分（持久版整个 schema 只有
  *    `command`），各配各的提示词。
  *
- * 7) 插件的裸包名（@deepseek-ai/*）是按**插件文件自己的位置**做 Node 解析的，不是按 profile。
+ * 8) 插件的裸包名（@deepseek-ai/*）是按**插件文件自己的位置**做 Node 解析的，不是按 profile。
  *    所以插件离开 $DSH_HOME/profiles/ 后 `import '@deepseek-ai/dsh-bash-local'` 会
  *    ERR_MODULE_NOT_FOUND。→ 用下面的 hostImport()：从 dsh 运行时自己的 node_modules
  *    解析包入口再 import。这样插件放哪儿都能加载，也不用往项目里塞 node_modules。
@@ -149,19 +161,45 @@ function resolveHost(specifier) {
 }
 
 const loadHost = async (specifier) => import(pathToFileURL(resolveHost(specifier)).href)
+
+/**
+ * 按顺序试一组包名，返回第一个能解析并加载成功的（返回 undefined 表示都没有）。
+ *
+ * 用途：dsh 0.1.7 把几个包改了名（agent 预设、执行器方法），插件要**同时**兼容
+ * 新旧版本，就得「新名在前、旧名兜底」—— 老版本上新名解析失败会走 catch，
+ * 自动落到旧名。注意只吞「解析/加载失败」，不吞别的。
+ */
+async function loadHostFirst(specifiers) {
+  for (const specifier of specifiers) {
+    try {
+      return await loadHost(specifier)
+    } catch {
+      // 换下一个候选
+    }
+  }
+  return undefined
+}
+
 const { LocalBashExecutor } = await loadHost('@deepseek-ai/dsh-bash-local')
 const { SandboxBashExecutor } = await loadHost('@deepseek-ai/dsh-bash-sandbox')
 const { TerminalSessionService } = await loadHost('@deepseek-ai/dsh-terminal')
 // serviceForAgent：从 reflect 原始 store 里按 fiber 归属取 agent 挂载的隔离服务。
 // 极简模式的 terminals 在 agent 入局隔离的 persistent-shell 组里，agent 自己的
 // scope ctx 和 host 都看不见它，只有这条文档化的「从外部读 agent 隔离服务」路径
-// 能拿到（api-proxy 的每个浏览器 RPC 都走它）。dsh-agent-presets 是核心包，但
-// 仍按插件惯例防御式加载：拿不到就退回直接读，绝不让插件启动失败。
+// 能拿到（api-proxy 的每个浏览器 RPC 都走它）。
+//
+// 包名随 dsh 版本改过：0.1.7-alpha 起叫 @deepseek-ai/dsh-agent-preset-registry
+// （dsh-agent-preset 只剩声明行，registry 才是实现），0.1.5-rc.x 叫
+// @deepseek-ai/dsh-agent-presets。函数签名两版完全一致，所以按名字逐个试即可。
+// 仍是防御式加载：两个都拿不到就退回直接读，绝不让插件启动失败。
 let serviceForAgent
-try {
-  ;({ serviceForAgent } = await loadHost('@deepseek-ai/dsh-agent-presets'))
-} catch {
-  serviceForAgent = undefined
+{
+  const mod =
+    (await loadHostFirst([
+      '@deepseek-ai/dsh-agent-preset-registry',
+      '@deepseek-ai/dsh-agent-presets'
+    ])) ?? undefined
+  serviceForAgent = typeof mod?.serviceForAgent === 'function' ? mod.serviceForAgent : undefined
 }
 
 /* -------------------------------------------------------------------------- */
@@ -691,18 +729,23 @@ function createBashPersistentExecute(registrationCtx) {
   const terminalsOf = (owner) => {
     // 首选文档化的生产路径：serviceForAgent 从 reflect 原始 store 里按 fiber 归属
     // 取 agent 挂载的 terminals（隔离组内注册的那份实例），不依赖调用方作用域。
+    // 第一个参数只被当作「能读到 reflect.store 的 ctx」用，所以注册时捕获的 ctx
+    // 和 agent 自己的 scope ctx 都行 —— 两个都试一遍，多一分保险。
     if (serviceForAgent !== undefined && owner?.ctx !== undefined) {
-      try {
-        const viaPreset = serviceForAgent(registrationCtx, owner, 'terminals')
-        if (
-          viaPreset !== undefined &&
-          typeof viaPreset.spawn === 'function' &&
-          typeof viaPreset.startSend === 'function'
-        ) {
-          return viaPreset
+      for (const inspector of [registrationCtx, owner?.ctx]) {
+        if (inspector === null || inspector === undefined) continue
+        try {
+          const viaPreset = serviceForAgent(inspector, owner, 'terminals')
+          if (
+            viaPreset !== undefined &&
+            typeof viaPreset.spawn === 'function' &&
+            typeof viaPreset.startSend === 'function'
+          ) {
+            return viaPreset
+          }
+        } catch {
+          // 换下一个候选
         }
-      } catch {
-        // 退回下面的候选
       }
     }
     // 兜底：注册时捕获的 ctx 与 exec.agent.ctx（标准模式等非隔离场景下直接可见）。
@@ -880,6 +923,22 @@ function createBashPersistentExecute(registrationCtx) {
 /* 执行器                                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * 【双版本接口】上游执行器的入口方法随 dsh 版本改过名，这里两套都实现：
+ *
+ *   dsh ≤ 0.1.5-rc.x            dsh ≥ 0.1.7-alpha
+ *   run(spec) -> 结算结果        execute(spec) -> ShellExecution 句柄
+ *   start(spec) -> 后台句柄      （调用方 await handle.result() 拿结算结果；
+ *   runArgv / startArgv           前台/后台只是「谁 await、await 多久」的差别）
+ *   ——                            executeArgv(spec, argv)
+ *
+ * 共同点：argv 由调用方给，所以本插件只要把 `["bash", "-c", cmd]` 换成
+ * `[<Git Bash 绝对路径>, "-c", cmd]` 就完事。**两类方法都定义**是安全的：
+ * 每个版本只会调自己那套，另一套是死代码（老版本没有 execute，新版本没有 run）。
+ * 一旦上游再改接口，这里会退化回上游默认 argv —— 也就是裸 `bash`（Windows 上
+ * ENOENT），排查时先看这里的两个方法名对不对得上。
+ */
+
 /** 不带沙箱的执行器：把上游 LocalBashExecutor 硬编码的 argv[0] 换成绝对路径。 */
 class GitBashLocalExecutor extends LocalBashExecutor {
   static inject = ['subprocess']
@@ -899,16 +958,45 @@ class GitBashLocalExecutor extends LocalBashExecutor {
   start(spec) {
     return this.startArgv(spec, shellArgv(spec.command))
   }
+
+  async execute(spec) {
+    return this.executeArgv(spec, shellArgv(spec.command))
+  }
+}
+
+/**
+ * 给句柄的 `result()` 投影补一条 sandbox 事实（新接口专用）。
+ *
+ * 上游 SandboxBashExecutor 在 danger-full-access 分支也会这么装饰（它有个
+ * static decorateResult 干这事）。上游有就用它的（语义/记忆化一致），没有
+ * （老版本或将来又改）就用等价的手写版：只包一次 `result()`，不改句柄本体 ——
+ * 句柄的**对象身份**是 onProcessDone 的键，不能换壳。
+ */
+function decorateSandboxResult(handle, fact) {
+  const decorate = SandboxBashExecutor.decorateResult
+  if (typeof decorate === 'function') return decorate(handle, (result) => ({ ...result, sandbox: fact }))
+  const base = handle.result.bind(handle)
+  let decorated
+  handle.result = () => {
+    decorated ??= base().then((result) => ({ ...result, sandbox: fact }))
+    return decorated
+  }
+  return handle
 }
 
 /**
  * 带沙箱的执行器：只重写 confine()，其余沿用 SandboxBashExecutor
  * （argv 交给 ctx.sandbox，win32 上由 ACL 受限令牌 runner 包一层）。
  * 注意 MSYS2 的 bash 在这个 runner 下起不来，见文件头第 4 条。
+ *
+ * confine 的第三个参数 signal 是 0.1.7 才加的（沙箱**准备阶段**的取消）；老版本
+ * 的 `ctx.sandbox.confine` 是同步的、多传一个参数会被忽略，所以这里一律转发 ——
+ * 新版本拿得到取消能力，老版本行为不变。返回值也照上游：老版本是 ConfinedArgv
+ * （同步），新版本是 Promise<ConfinedArgv>，各自的上游调用点自己 await/直接读。
  */
 class GitBashSandboxExecutor extends SandboxBashExecutor {
-  confine(command, policy) {
-    return this.ctx.sandbox.confine(shellArgv(command), policy)
+  confine(command, policy, signal) {
+    return this.ctx.sandbox.confine(shellArgv(command), policy, signal)
   }
 
   /**
@@ -929,6 +1017,16 @@ class GitBashSandboxExecutor extends SandboxBashExecutor {
       return this.startArgv(spec, shellArgv(spec.command))
     }
     return super.start(spec)
+  }
+
+  async execute(spec) {
+    if (spec.sandboxPolicy?.mode === 'danger-full-access') {
+      return decorateSandboxResult(await this.executeArgv(spec, shellArgv(spec.command)), {
+        mode: 'danger-full-access',
+        denied: false
+      })
+    }
+    return super.execute(spec)
   }
 }
 
@@ -1009,5 +1107,12 @@ export const internals = {
   partialBashOutput,
   renderBashOutput,
   retainedBashScrollback,
-  createBashPersistentExecute
+  createBashPersistentExecute,
+  // 双版本执行器（0.1.7 起 run/start -> execute，见「执行器」一节）
+  GitBashLocalExecutor,
+  GitBashSandboxExecutor,
+  decorateSandboxResult,
+  shellArgv,
+  // 上游包（供自测脚本核对接口面：不同 dsh 版本里这些方法名不一样）
+  upstream: { LocalBashExecutor, SandboxBashExecutor, TerminalSessionService, serviceForAgent }
 }

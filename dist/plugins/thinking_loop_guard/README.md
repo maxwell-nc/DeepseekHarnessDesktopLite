@@ -39,7 +39,16 @@
 分支重跑 / 已中断 / 已截断 / 仅记录 / 预警。图标灰色 = 自动中断关，绿色 = 自动中断开；
 流式进行中角标蓝点、有未读命中角标红色数字（点击即已读）。React 重渲染输入框后由
 MutationObserver + 轮询自动归位；锚不进底栏时 6 秒后兜底显示右下角悬浮球。
-依赖客户端 `sessions` 服务（跳转新分支用），与 retry 相同。
+依赖客户端 `sessions` 服务（跳转新分支用），与 retry 相同。**跳转入口从 0.1.7 起
+换了名字**（`sessions.open` 没了，改用 `uiWorkspace.openSession`），所以浏览器半边
+从 v1.2.2 起两个都试：优先 `uiWorkspace.openSession`，退回 `sessions.open` ——
+用老写法在 0.1.7 上是「分支建好了但界面不跳」，不报错。
+
+**v1.2.3 修掉一个启动即崩**：`uiWorkspace` 不在 `inject` 里（它可能比本插件晚挂上，
+写进 inject 会让守卫一直 pending），而 cordis 的 `ctx.uiWorkspace` 属性访问在服务
+还没就绪时会**抛** `cannot get property "uiWorkspace" without inject` —— apply 里抛
+异常 = 条目 failed，界面直接报 `dsh-loop-guard: failed`。改用 `optionalService()`
+（`ctx.get(id)` 拿不到给 undefined）取它。规则见根 README「浏览器半边取服务的规矩」。
 
 ## 接口
 
