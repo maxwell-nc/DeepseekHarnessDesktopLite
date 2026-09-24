@@ -33,6 +33,11 @@ import webbrowser
 import zipfile
 from collections import deque
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover —— 打包环境必有，这里只是兜底
+    yaml = None
+
 # 源码旁边的 __pycache__ 是噪音，统一丢到 <项目根>/build/pycache 下。
 # 必须在导入本项目自己的模块（app_icon）之前设置，否则 pyc 已经落进 src/ 了。
 if not hasattr(sys, "_MEIPASS"):        # frozen 时不折腾，bundle 里没这个概念
@@ -1094,6 +1099,145 @@ def _skip_reparse(src, names):
     return {name for name in names if _is_reparse(os.path.join(src, name))}
 
 
+# 旧 settings.yaml 的 section -> profile entry id（与 dsh-settings 的
+# LEGACY_SECTION_ENTRIES 一致）。shell 段刻意不迁：pwsh/bash-sandbox 是 base
+# bundle 的默认 entry（带 disabled 表达式），迁移会覆盖它，保留在 .imported 即可。
+_LEGACY_SECTION_ENTRIES = {
+    "ui-developer-tools": "ui-settings",
+    "ui-onboarding": "ui-settings-general",
+}
+# entry id -> 包名（cordis.patch.yml 的 name 字段）
+_LEGACY_ENTRY_NAMES = {
+    "ui-settings": "@deepseek-ai/dsh-client-ui-settings",
+    "ui-settings-general": "@deepseek-ai/dsh-client-ui-settings-general",
+    "llm-pi-ai": "@deepseek-ai/dsh-llm-pi-ai",
+    "agent-default-model": "@deepseek-ai/dsh-agent-default-model",
+}
+
+
+def _version_consumes_legacy_settings(version):
+    """该版本槽位的 dsh 是否会把 settings.yaml 改名消费（0.1.7+ 的 dsh-settings）。
+
+    0.1.7 起 dsh-settings 启动时把 settings.yaml 改名成 settings.yaml.imported 并
+    导入 profile；0.1.5 及更早没有这个机制，settings.yaml 就是**活配置**，不能动。
+    按槽位里 dsh-settings 的代码特征判断，不写死版本号。
+    """
+    ver = sanitize_version(version)
+    if not ver:
+        return False
+    pkg = os.path.join(
+        RUNTIME_DIR, "slots", ver, "node_modules", "@deepseek-ai",
+        "dsh-settings", "lib", "index.js",
+    )
+    if not os.path.isfile(pkg):
+        return False
+    try:
+        with open(pkg, "r", encoding="utf-8") as fh:
+            return "importLegacyDocument" in fh.read()
+    except OSError:
+        return False
+
+
+def _skip_reparse_and_legacy_settings(src, names):
+    """copytree 的 ignore 回调：丢掉 reparse point 和旧版 settings.yaml。
+
+    settings.yaml 是 dsh 0.1.7 之前的老配置格式；0.1.7 起 dsh-settings 每次启动
+    都会把它**改名**成 settings.yaml.imported 并导入 profile（importLegacyDocument），
+    导入失败的 section 就静默丢了。直接拷过去等于把用户配置送给它消费，所以这里
+    跳过，由 _migrate_legacy_settings 在复制后自己迁移进 profile。
+    """
+    skip = {name for name in names if _is_reparse(os.path.join(src, name))}
+    if "settings.yaml" in names:
+        skip.add("settings.yaml")
+    return skip
+
+
+def _migrate_legacy_settings(home_dir, settings_src=None, say=None):
+    """把旧 settings.yaml 迁进 profile（cordis.patch.yml），并落成 .imported。
+
+    dsh 0.1.7 起 settings.yaml 不再是配置格式：启动时 dsh-settings 会把它改名成
+    settings.yaml.imported 并把各 section 导入 profile。但导入要求目标 entry 已
+    存在于 profile —— 全新 home 里 llm-pi-ai 这类非默认 entry 不在，导入直接失败，
+    配置就静默丢了。这里替 dsh 完成迁移：
+
+      * 已知 section -> entry 映射的，写进目标 profile（已存在的 entry 不覆盖）；
+      * 原文件内容落成 settings.yaml.imported —— dsh 启动时看到没有 settings.yaml
+        就不会再消费，数据也留了底。
+
+    settings_src 给定时从它读（复制场景：settings.yaml 已被 copytree 跳过，目标
+    目录里没有）；否则从 home_dir/settings.yaml 读（启动兜底：用户手动拷回的旧
+    文件，在 dsh 启动前先替它迁移）。任何一步失败都不抛 —— 配置目录准备失败
+    不该挡住服务启动。
+    """
+    src = settings_src or os.path.join(home_dir, "settings.yaml")
+    if not os.path.isfile(src):
+        return
+    try:
+        with open(src, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        log("读旧 settings.yaml 失败 %s: %s" % (src, exc))
+        return
+    # 原样落一份 .imported：dsh 看到没有 settings.yaml 就不会消费，数据也不丢
+    imported_path = os.path.join(home_dir, "settings.yaml.imported")
+    try:
+        with open(imported_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    except OSError as exc:
+        log("写 %s 失败: %s" % (imported_path, exc))
+    # 迁移进 profile
+    if yaml is None:
+        log("没有 yaml 库，旧 settings.yaml 只保留在 .imported（未导入 profile）")
+        return
+    try:
+        sections = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001
+        log("解析旧 settings.yaml 失败 %s: %s" % (src, exc))
+        return
+    if not isinstance(sections, dict) or not sections:
+        return
+    patch_path = os.path.join(home_dir, "profiles", PLUGIN_PROFILE, "cordis.patch.yml")
+    try:
+        with open(patch_path, "r", encoding="utf-8") as fh:
+            current = fh.read()
+    except OSError:
+        current = ""
+    existing = set(re.findall(r"(?m)^-\s*id:\s*([\w.-]+)\s*$", current))
+    entries = []
+    for section, values in sections.items():
+        entry_id = _LEGACY_SECTION_ENTRIES.get(section, section)
+        if entry_id in existing:
+            continue
+        entry_name = _LEGACY_ENTRY_NAMES.get(entry_id)
+        if not entry_name:
+            log("旧 settings.yaml 的 section %r 没有已知 entry 映射，保留在 .imported" % section)
+            continue
+        entries.append({"id": entry_id, "name": entry_name, "config": values})
+    if not entries:
+        return
+    try:
+        block = yaml.safe_dump(entries, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    except Exception as exc:  # noqa: BLE001
+        log("序列化 profile entry 失败: %s" % exc)
+        return
+    if current and not current.endswith("\n"):
+        current += "\n"
+    new = current + "\n" + block
+    try:
+        with open(patch_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(new)
+    except OSError as exc:
+        log("写 profile 补丁失败 %s: %s" % (patch_path, exc))
+        return
+    message = "旧 settings.yaml 已迁移进 profile（%d 个 section）" % len(entries)
+    log("[home] %s: %s" % (home_dir, message))
+    if say is not None:
+        try:
+            say(message)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def home_dir_for(version):
     """某版本的配置目录（不存在也返回路径）。"""
     ver = sanitize_version(version)
@@ -1244,14 +1388,24 @@ def ensure_version_home(version=None, note=None):
             say("创建配置目录失败 %s: %s" % (dest, exc))
             return {"dir": dest, "created": False, "source": None}
         if source:
+            # 目标版本 0.1.7+ 会把 settings.yaml 改名消费（importLegacyDocument），
+            # 直接拷过去等于把用户配置送给它消费；跳过它，复制后由
+            # _migrate_legacy_settings 迁移进 profile。老版本（0.1.5 及更早）
+            # settings.yaml 是活配置，照常原样拷。
+            consumes = _version_consumes_legacy_settings(ver)
             try:
                 # ignore 会丢掉 junction：dsh 下次启动自己按活动槽位重建
-                shutil.copytree(source, dest, dirs_exist_ok=True, ignore=_skip_reparse)
+                ignore = _skip_reparse_and_legacy_settings if consumes else _skip_reparse
+                shutil.copytree(source, dest, dirs_exist_ok=True, ignore=ignore)
             except Exception as exc:  # noqa: BLE001
                 say("复制配置目录失败（按全新目录继续）%s -> %s: %s" % (source, dest, exc))
                 source = None
             else:
                 say("配置目录 %s 已从 %s 复制" % (dest, source))
+                if consumes:
+                    _migrate_legacy_settings(
+                        dest, settings_src=os.path.join(source, "settings.yaml"), say=say
+                    )
         else:
             say("全新配置目录: %s" % dest)
         created = True
@@ -2047,8 +2201,104 @@ def _render_managed_block(installed):
     return "%s\n%s\n%s\n" % (PATCH_BEGIN, "\n\n".join(chunks), PATCH_END)
 
 
+def _patch_yaml_loader():
+    """返回能容忍 dsh profile 补丁里 ``!!js`` 表达式的 YAML loader 类。
+
+    ``!!js "!ctx.get(...)"`` 这类表达式在补丁里是合法的（loader 会求值），外壳
+    只读不写，原样当字符串解析即可。yaml 缺失时返回 None。
+    """
+    if yaml is None:
+        return None
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def js_constructor(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        return loader.construct_mapping(node, deep=True)
+
+    Loader.add_multi_constructor("tag:yaml.org,2002:js", js_constructor)
+    return Loader
+
+
+def _parse_patch_entries(text):
+    """把 cordis.patch.yml 的条目列表解析成 Python 对象；失败返回 None。"""
+    loader = _patch_yaml_loader()
+    if loader is None:
+        return None
+    try:
+        data = yaml.load(text, Loader=loader)
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _entry_ids(entries):
+    """收集条目列表里的 entry id：顶层 id + insert 列表里的嵌套 id。"""
+    ids = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("id"), str):
+            ids.add(entry["id"])
+        inserts = entry.get("insert")
+        if isinstance(inserts, list):
+            for sub in inserts:
+                if isinstance(sub, dict) and isinstance(sub.get("id"), str):
+                    ids.add(sub["id"])
+    return ids
+
+
+def _foreign_entries_text(block_text, regenerated_text):
+    """当前托管块里不属于插件生成的条目，序列化成 YAML 文本（没有就返回空串）。
+
+    dsh 的设置编辑器会把设置 entry（llm-pi-ai 等）写进托管块区域（结束标记之前）；
+    重建托管块时这些条目不在插件片段里，整块丢弃就会把用户设置删掉。这里按
+    entry id 找出它们并原样保留。解析失败时保守返回空串（宁可丢格式、不丢数据
+    的相反方向：解析不了就不动块，见 _write_managed_patch 的兜底）。
+    """
+    if not block_text:
+        return ""
+    current_entries = _parse_patch_entries(block_text)
+    if current_entries is None:
+        return ""
+    if regenerated_text and regenerated_text.strip():
+        regenerated = _parse_patch_entries(regenerated_text)
+        if regenerated is None:
+            return ""
+        plugin_ids = _entry_ids(regenerated)
+    else:
+        # 没有插件（托管块重建为空）：块里所有带 id 的条目都不是插件生成的
+        plugin_ids = set()
+    extra = [
+        entry
+        for entry in current_entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and entry["id"] not in plugin_ids
+    ]
+    if not extra:
+        return ""
+    if yaml is None:
+        return ""
+    try:
+        return yaml.safe_dump(
+            extra, allow_unicode=True, sort_keys=False, default_flow_style=False
+        ).rstrip("\n")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _write_managed_patch(profile_dir, installed):
-    """重写 <profile>/cordis.patch.yml：托管块之外的内容一律原样保留。"""
+    """重写 <profile>/cordis.patch.yml：托管块之外的内容一律原样保留。
+
+    dsh 的设置编辑器会把 llm-pi-ai 这类设置 entry 写进托管块区域（在结束标记
+    之前），所以重建托管块时不能整块丢弃 —— 只替换插件生成的条目，把「不是
+    插件生成的」条目（设置 entry 等）原样保留在块里。
+    """
     path = os.path.join(profile_dir, "cordis.patch.yml")
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -2057,19 +2307,30 @@ def _write_managed_patch(profile_dir, installed):
         current = ""
 
     user = current
+    block_text = ""
     if PATCH_BEGIN in user and PATCH_END in user:
-        user = user[: user.index(PATCH_BEGIN)] + user[user.index(PATCH_END) + len(PATCH_END):]
+        begin = user.index(PATCH_BEGIN)
+        end = user.index(PATCH_END) + len(PATCH_END)
+        block_text = user[begin:end]
+        user = user[:begin] + user[end:]
     user = user.strip()
 
     body_is_empty = _strip_comments(user) in ("", "[]")
     block = _render_managed_block(installed)
+    # 当前块里「不是插件生成的」条目（dsh 设置编辑器写进来的）—— 无论有没有
+    # 插件都要保留，否则禁用全部插件时设置 entry 会跟着托管块一起被清掉。
+    extra = _foreign_entries_text(block_text, block or "")
 
     if block is None:
-        new = PATCH_HEADER + "[]\n" if body_is_empty else user + "\n"
-    elif body_is_empty:
-        new = PATCH_HEADER + "\n" + block
+        if extra:
+            new = PATCH_HEADER + "\n" + PATCH_BEGIN + "\n" + extra + "\n" + PATCH_END + "\n"
+        else:
+            new = PATCH_HEADER + "[]\n" if body_is_empty else user + "\n"
     else:
-        new = user + "\n\n" + block
+        # 保留条目插在结束标记之前 —— 结构稳定，下次重建时还能原样识别，幂等。
+        if extra:
+            block = block.replace(PATCH_END, extra + "\n" + PATCH_END, 1)
+        new = PATCH_HEADER + "\n" + block if body_is_empty else user + "\n\n" + block
 
     if new == current:
         return "unchanged"
@@ -5193,6 +5454,11 @@ def main():
         if home_info.get("created"):
             mark("配置目录已就绪: %s（来源 %s）"
                  % (home_info["dir"], home_info.get("source") or "全新"))
+        # 启动兜底：用户手动拷回 settings.yaml 时，在 dsh 启动前先替它迁移进
+        # profile，避免被 dsh-settings 的 importLegacyDocument 静默消费掉。
+        # 只对会消费它的版本（0.1.7+）做；老版本 settings.yaml 是活配置，不动。
+        if _version_consumes_legacy_settings(active_slot_version()):
+            _migrate_legacy_settings(home_info["dir"])
     except Exception as exc:  # noqa: BLE001
         log("准备配置目录异常（继续启动）: %s" % exc)
     if (os.environ.get("DSH_HOME") or "").strip():
